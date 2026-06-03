@@ -1,0 +1,2509 @@
+# -*- coding: utf-8 -*-
+"""
+SleepEEGFeatureExtractor — 睡眠脑电特征提取器 (增强版)
+====================================================
+从单通道到全脑多维特征：幂律、熵、分形、复杂度、连接性、微状态、图论。
+
+环境: conda activate eeg_101night
+"""
+
+import mne
+import os
+import yasa
+import numpy as np
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+import pandas as pd
+import scipy
+from scipy import signal, stats
+try:
+    from sssm_07.sssm.sssm import Model
+    HAS_SSSM = True
+except ImportError:
+    HAS_SSSM = False
+    Model = None
+import unittest
+# pyrasa not used — we use yasa.irasa directly
+import mne_features
+import mne_microstates
+from mne_features.univariate import (compute_pow_freq_bands, compute_spect_entropy,
+                                      compute_hjorth_mobility, compute_hjorth_complexity)
+import pycatch22
+
+# ---- 可选：非线性特征库 ----
+try:
+    import antropy as ant
+    HAS_ANTROPY = True
+except ImportError:
+    HAS_ANTROPY = False
+
+try:
+    import neurokit2 as nk
+    HAS_NEUROKIT2 = True
+except ImportError:
+    HAS_NEUROKIT2 = False
+
+try:
+    import networkx as nx
+    HAS_NX = True
+except ImportError:
+    HAS_NX = False
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+
+# ═══════════════════════════════════════════════════════════
+#  MFF metadata parser (bypass MNE EGI reader memory issues)
+# ═══════════════════════════════════════════════════════════
+def _read_mff_metadata(mff_path_str):
+    """Parse .mff metadata from sensorLayout.xml + signal1.bin.
+    Returns: {ch_names, n_channels, sfreq, n_times}
+    """
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+
+    mff = Path(mff_path_str)
+
+    # ── sensorLayout.xml → channel names ──
+    layout_path = mff / "sensorLayout.xml"
+    if not layout_path.exists():
+        raise FileNotFoundError(f"sensorLayout.xml not found in {mff}")
+
+    ltree = ET.parse(str(layout_path))
+    lroot = ltree.getroot()
+    lns = lroot.tag.split('}')[0] + '}' if '}' in lroot.tag else ''
+
+    sensors_el = lroot.find(f'{lns}sensors')
+    if sensors_el is None:
+        raise ValueError("No <sensors> in sensorLayout.xml")
+
+    channels = []
+    for sensor in sensors_el.findall(f'{lns}sensor'):
+        snum_el = sensor.find(f'{lns}number')
+        stype_el = sensor.find(f'{lns}type')
+        sname_el = sensor.find(f'{lns}name')
+        sname = sname_el.text.strip() if sname_el is not None and sname_el.text else ""
+        stype = int(stype_el.text) if stype_el is not None else 0
+        snum = int(snum_el.text) if snum_el is not None else 0
+        if sname:
+            channels.append(sname)
+        elif stype == 0:
+            channels.append(f"E{snum}")
+
+    # ── n_channels from signal1.bin size ──
+    signal_path = mff / "signal1.bin"
+    file_size = signal_path.stat().st_size
+    total_values = file_size // 4
+    n_channels = 260
+    if total_values % 260 != 0:
+        for n in [257, 256, 261, 259, 258, 269]:
+            if total_values % n == 0:
+                n_channels = n
+                break
+    n_times = total_values // n_channels
+
+    # truncate/pad channel names to match
+    if len(channels) > n_channels:
+        channels = channels[:n_channels]
+    while len(channels) < n_channels:
+        channels.append(f"AUX{len(channels)+1}")
+
+    # ── sfreq: EGI 256 hardware is 250 Hz ──
+    sfreq = 250.0
+    for info_name in ["info1.xml", "info.xml"]:
+        ip = mff / info_name
+        if not ip.exists():
+            continue
+        itree = ET.parse(str(ip))
+        iroot = itree.getroot()
+        ins = iroot.tag.split('}')[0] + '}' if '}' in iroot.tag else ''
+        sr = iroot.find(f'{ins}sampRate')
+        if sr is None:
+            sr = iroot.find(f'.//{ins}sampRate')
+        if sr is not None and sr.text:
+            sfreq_xml = float(sr.text)
+            if sfreq_xml > 0 and 100 <= sfreq_xml <= 2000:
+                sfreq = sfreq_xml
+            break
+
+    return {'ch_names': channels, 'n_channels': n_channels,
+            'sfreq': sfreq, 'n_times': n_times}
+
+
+def _load_channel_data(mff_path_str, n_channels, channel_indices,
+                        n_times=None, sfreq=None, filter_params=None):
+    """Load selected channels from signal1.bin using chunked frombuffer.
+
+    Uses pre-allocated buffer + f.readinto() + np.frombuffer() to avoid
+    malloc fragmentation from repeated np.fromfile() calls.
+    Reference: numpy/numpy#30777
+
+    Args:
+        mff_path_str: path to .mff directory
+        n_channels: total channels in the interleaved file
+        channel_indices: list of channel indices to extract
+        n_times: optional, auto-detected if None
+        sfreq: optional sampling rate (for filtering)
+        filter_params: optional (low, high) bandpass
+
+    Returns:
+        dict mapping channel_name -> 1D float64 array (uV)
+    """
+    from pathlib import Path
+    import gc
+
+    signal_path = Path(mff_path_str) / "signal1.bin"
+
+    CHUNK_VALUES = 500_000  # ~2 MB
+    _buf = np.empty(CHUNK_VALUES, dtype=np.float32)
+    _buf_mv = memoryview(_buf).cast('B')
+
+    channel_chunks = {idx: [] for idx in channel_indices}
+
+    with open(str(signal_path), "rb") as f:
+        while True:
+            n_read = f.readinto(_buf_mv)
+            if n_read == 0:
+                break
+            n_values = n_read // 4
+            if n_values < n_channels:
+                if n_values == 0:
+                    break
+                chunk = _buf[:n_values]
+            else:
+                chunk = _buf
+            n_samples = n_values // n_channels
+            if n_samples == 0:
+                break
+            chunk_2d = chunk[:n_samples * n_channels].reshape(n_samples, n_channels)
+            for idx in channel_indices:
+                channel_chunks[idx].append(chunk_2d[:, idx].copy())
+
+    result = {}
+    for idx in channel_indices:
+        data = np.concatenate(channel_chunks[idx]).astype("float64") * 1e6
+        result[idx] = data
+
+    gc.collect()
+    return result
+
+
+class SleepEEGFeatureExtractor:
+    """
+    睡眠脑电特征提取器
+
+    该类用于从睡眠脑电数据中提取各种特征，包括睡眠分期、时间信息、
+    特征波、非周期特征、熵、分形、复杂度、功能连接、微状态等。
+
+    Attributes:
+        raw: 原始脑电数据对象（单通道）
+        sfreq: 采样频率
+        data: EEG数据数组（单通道）
+        ch_names: 通道名称列表
+    """
+
+    # ---- 频段定义 ----
+    FREQ_BANDS = {
+        'delta': (0.5, 4),
+        'theta': (4, 8),
+        'alpha': (8, 13),
+        'beta': (13, 30),
+        'gamma': (30, 45),
+    }
+    BAND_EDGES = np.array([0.5, 4, 8, 13, 30, 45])
+    BAND_NAMES = ['delta', 'theta', 'alpha', 'beta', 'gamma']
+
+    def __init__(self, file_path, eeg_channel='E21',
+                 load_all_channels: bool = True,
+                 filter_low: float = 0.1,
+                 filter_high: float = 40.0):
+        """
+        初始化特征提取器
+
+        - 使用 MNE mne.io.read_raw_egi 加载 .mff 文件
+        - 滤波使用 MNE 默认 FIR 设计 (firwin, zero-phase, 自动阶数)
+        - 单通道: 仅加载目标通道，内存 ~60 MB
+        - 多通道: 惰性加载 (lazy)，仅在首次调用多通道特征方法时从磁盘读取
+          通过 chunked frombuffer 加载，避免 MNE 全通道预加载的内存问题
+
+        Args:
+            file_path: .mff文件路径
+            eeg_channel: 用于单通道分析的主要EEG通道名称
+            load_all_channels: 是否允许多通道特征 (惰性加载)
+            filter_low: 带通滤波低频截止 (Hz)
+            filter_high: 带通滤波高频截止 (Hz)
+        """
+        self.file_path = file_path
+        self.eeg_channel = eeg_channel
+        self.filter_low = filter_low
+        self.filter_high = filter_high
+
+        # ── Step 1: MNE 加载元数据 (不预加载数据) ──
+        raw = mne.io.read_raw_egi(file_path, preload=False, verbose=False)
+        self.ch_names = raw.ch_names
+        self.n_channels = len(raw.ch_names)
+        self.sfreq = int(raw.info['sfreq'])
+
+        # ── Step 2: 检查主通道 ──
+        if eeg_channel not in self.ch_names:
+            eeg_channel = self.ch_names[10]
+            self.eeg_channel = eeg_channel
+        self._eeg_idx = self.ch_names.index(eeg_channel)
+
+        # ── Step 3: 仅加载主通道数据 ──
+        raw.pick([eeg_channel])
+        raw.load_data()
+        self.raw = raw
+        self.data = self.raw.get_data(units='uV')[0]  # 1D float64, ~60 MB
+
+        # ── Step 3b: MNE 默认 FIR 滤波 (firwin, zero-phase, 自动阶数) ──
+        self.filted_raw = self.raw.copy().filter(filter_low, filter_high)
+        self.filted = self.filted_raw.get_data(units='uV')[0]
+
+        # ── Step 4: 多通道惰性加载 ──
+        self._load_all = load_all_channels
+        self._data_all = None      # lazy: loaded on first access
+        self._filted_cache = None  # lazy: filtered version
+        self._eeg_ch_indices = [i for i, ch in enumerate(self.ch_names)
+                                if ch.startswith('E') and ch[1:].isdigit()]
+        self.n_times = self.data.size  # 兼容 _get_data_all 等方法
+
+        # ── 存储提取的特征 ──
+        self.features = {}
+        self._epoch_info = {}
+
+    # ================================================================
+    #  Part 0 — 工具方法
+    # ================================================================
+
+    def _get_data_all(self):
+        """惰性加载全通道 float64 数据 (首次调用时从磁盘读取，约 7.5 GB)。
+
+        使用 chunked frombuffer + 预分配缓冲区，避免 malloc 碎片化。
+        缓存结果到 self._data_all，后续调用直接返回缓存。
+        """
+        if self._data_all is not None:
+            return self._data_all
+        if not self._load_all:
+            return None
+
+        print("[LazyLoad] 首次加载全部 %d 通道数据..." % self.n_channels)
+        import gc
+        ch_data = _load_channel_data(self.file_path, self.n_channels,
+                                      list(range(self.n_channels)),
+                                      n_times=self.n_times)
+        # Stack into (n_channels, n_times) array
+        data_all = np.stack([ch_data[i] for i in range(self.n_channels)], axis=0)
+        del ch_data; gc.collect()
+        print(f"[LazyLoad] 完成: {data_all.shape}, {data_all.nbytes/1e9:.1f} GB")
+        self._data_all = data_all
+        return data_all
+
+    def _get_filted_all(self):
+        """惰性加载滤波后的全通道数据 (仅在需要时计算)。
+
+        基于 _get_data_all() 的结果做带通滤波。
+        缓存结果到 self._filted_cache。
+        """
+        if self._filted_cache is not None:
+            return self._filted_cache
+
+        data = self._get_data_all()
+        if data is None:
+            return None
+
+        print("[LazyLoad] 对全通道数据滤波 (%.1f-%.1f Hz, FIR)..."
+              % (self.filter_low, self.filter_high))
+        import gc
+        # MNE 默认 FIR (firwin, zero-phase, 自动阶数)
+        info = mne.create_info(
+            [f"ch{i}" for i in range(data.shape[0])],
+            self.sfreq, ch_types=['eeg'] * data.shape[0])
+        raw_all = mne.io.RawArray(data, info, verbose=False)
+        raw_all.filter(self.filter_low, self.filter_high)
+        filtered = raw_all.get_data()
+        del data, raw_all; gc.collect()
+        self._filted_cache = filtered
+        return filtered
+
+    # ── ROI (Region of Interest) 空间聚合 ──────────────────────
+
+    def _parse_sensor_coords(self):
+        """从 sensorLayout.xml 解析 EEG 通道的 3D 坐标。
+
+        Returns:
+            coords: np.array (n_eeg, 3) 按通道索引顺序排列
+            eeg_indices: list[int] — 对应 ch_names 中 EEG 通道的索引
+        """
+        import xml.etree.ElementTree as ET
+        from pathlib import Path
+
+        mff = Path(self.file_path)
+        layout_path = mff / "sensorLayout.xml"
+        tree = ET.parse(str(layout_path))
+        root = tree.getroot()
+        ns = root.tag.split('}')[0] + '}' if '}' in root.tag else ''
+
+        sensors = root.find(f'{ns}sensors').findall(f'{ns}sensor')
+        coords = []
+        eeg_indices = []
+        # sensor number 1 → ch_names index 0, number 2 → index 1, etc.
+        # But we need to map through ch_names to get the right indices
+        for sensor in sensors:
+            stype_el = sensor.find(f'{ns}type')
+            stype = int(stype_el.text) if stype_el is not None else 0
+            if stype != 0:  # only EEG channels
+                continue
+            snum_el = sensor.find(f'{ns}number')
+            snum = int(snum_el.text) if snum_el is not None else 0
+            # sensor number → channel name E{n} → look up in ch_names
+            ch_name = f"E{snum}"
+            if ch_name in self.ch_names:
+                idx = self.ch_names.index(ch_name)
+                x = float(sensor.find(f'{ns}x').text)
+                y = float(sensor.find(f'{ns}y').text)
+                z = float(sensor.find(f'{ns}z').text)
+                coords.append([x, y, z])
+                eeg_indices.append(idx)
+
+        return np.array(coords), eeg_indices
+
+    def _build_roi_groups(self, n_rois=25, random_state=42):
+        """基于 3D 坐标的空间 k-means 聚类，将 EEG 通道分组为 ROI。
+
+        每个 ROI 内的通道在空间上相邻，平均后代表该脑区的活动。
+        EGI 256 → 25 ROI 意味着平均 ~10 个通道/ROI。
+
+        Args:
+            n_rois: ROI 数量 (默认 25)
+            random_state: k-means 随机种子
+
+        Returns:
+            list of list of int — 每项是 ch_names 中属于该 ROI 的通道索引
+        """
+        coords, eeg_indices = self._parse_sensor_coords()
+        n_eeg = len(eeg_indices)
+
+        if n_eeg <= n_rois:
+            # 通道数少于 ROI 数，每个通道单独成组
+            return [[idx] for idx in eeg_indices]
+
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=n_rois, random_state=random_state,
+                        n_init=10, max_iter=300)
+        labels = kmeans.fit_predict(coords)
+
+        # 按标签分组
+        roi_groups = [[] for _ in range(n_rois)]
+        for i, label in enumerate(labels):
+            roi_groups[label].append(eeg_indices[i])
+
+        # 按组大小排序
+        roi_groups.sort(key=len, reverse=True)
+        return roi_groups
+
+    def _get_roi_data(self, n_rois=25, filtered=True):
+        """加载 EEG 通道数据并聚合到 ROI 级别。
+
+        Args:
+            n_rois: ROI 数量
+            filtered: True → 对加载的数据做带通滤波后聚合
+
+        返回: (n_rois, n_times) float64 — 每个 ROI 是成员通道的瞬时均值
+        """
+        import gc
+
+        if not hasattr(self, '_roi_groups'):
+            print(f"[ROI] 使用 k-means 空间聚类: {self.n_channels} 通道 → {n_rois} 脑区")
+            self._roi_groups = self._build_roi_groups(n_rois=n_rois)
+            sizes = [len(g) for g in self._roi_groups]
+            print(f"[ROI] 组大小: min={min(sizes)}, max={max(sizes)}, "
+                  f"mean={np.mean(sizes):.1f}")
+
+        # 收集所有需要加载的通道索引
+        all_indices = []
+        for group in self._roi_groups:
+            all_indices.extend(group)
+        all_indices = sorted(set(all_indices))
+
+        # 加载这些通道
+        print(f"[ROI] 加载 {len(all_indices)} 个 EEG 通道"
+              + (" (滤波后聚合)" if filtered else "") + "...")
+        ch_data = _load_channel_data(self.file_path, self.n_channels,
+                                      all_indices, n_times=self.n_times)
+
+        # 可选: 带通滤波 (MNE 默认 FIR, zero-phase)
+        if filtered:
+            import gc as _gc
+            n_ch_roi = len(all_indices)
+            stacked = np.stack([ch_data[idx] for idx in all_indices], axis=0)
+            info = mne.create_info(
+                [f"ch{i}" for i in range(n_ch_roi)], self.sfreq,
+                ch_types=['eeg'] * n_ch_roi, verbose=False)
+            raw_roi = mne.io.RawArray(stacked, info, verbose=False)
+            raw_roi.filter(self.filter_low, self.filter_high)
+            filt_data = raw_roi.get_data()
+            for i, idx in enumerate(all_indices):
+                ch_data[idx] = filt_data[i]
+            del stacked, raw_roi, filt_data; _gc.collect()
+
+        # 聚合到 ROI
+        n_times_actual = len(ch_data[all_indices[0]])
+        roi_data = np.zeros((len(self._roi_groups), n_times_actual))
+        for roi_idx, group in enumerate(self._roi_groups):
+            group_data = [ch_data[idx] for idx in group]
+            roi_data[roi_idx] = np.mean(group_data, axis=0)
+
+        del ch_data; gc.collect()
+        print(f"[ROI] 聚合完成: {roi_data.shape}, {roi_data.nbytes/1e6:.0f} MB")
+        return roi_data
+
+    def _iter_epochs(self, data: np.ndarray, epoch_sec: float,
+                     return_1d: bool = True):
+        """
+        迭代器：将数据切分为 epoch，每次返回一个片段。
+
+        Args:
+            data: shape (n_channels, n_times) 或 (n_times,)
+            epoch_sec: epoch 长度（秒）
+            return_1d: True → 返回 1D，False → 保持 2D
+
+        Yields:
+            (epoch_idx, segment)
+        """
+        sf = self.sfreq
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+        n_ch, n_total = data.shape
+        epoch_samples = int(epoch_sec * sf)
+        n_epochs = n_total // epoch_samples
+        for ep in range(n_epochs):
+            seg = data[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+            if return_1d and n_ch == 1:
+                seg = seg[0]
+            yield ep, seg
+
+    def _get_n_epochs(self, epoch_sec: float) -> int:
+        """计算给定窗长下的 epoch 数。"""
+        return int(self.data.size // (epoch_sec * self.sfreq))
+
+    def _store_feature(self, name: str, values: np.ndarray, meta: dict = None):
+        """统一存储特征，跟踪 epoch 信息。"""
+        self.features[name] = {
+            'values': values,
+            'meta': meta or {},
+        }
+        if values.ndim == 1:
+            self._epoch_info[name] = {'n_epochs': len(values)}
+        elif values.ndim == 2:
+            self._epoch_info[name] = {'n_epochs': values.shape[0],
+                                       'n_dims': values.shape[1]}
+
+    # ================================================================
+    #  Part 1 — 基础信息
+    # ================================================================
+
+    def recording_date(self):
+        """
+        提取脑电记录的日期和时间信息。
+
+        Returns:
+            包含日期时间信息的字典
+        """
+        try:
+            meas_date = self.raw.info['meas_date']
+            if isinstance(meas_date, tuple):
+                dt_obj = datetime.fromtimestamp(meas_date[0])
+            else:
+                dt_obj = meas_date
+
+            date_info = {
+                'datetime': dt_obj,
+                'date': dt_obj.date(),
+                'time': dt_obj.time(),
+                'year': dt_obj.year,
+                'month': dt_obj.month,
+                'day': dt_obj.day,
+                'hour': dt_obj.hour,
+                'minute': dt_obj.minute,
+                'second': dt_obj.second
+            }
+            self.features['recording_date'] = date_info
+            return date_info
+        except Exception as e:
+            print(f"日期时间提取失败: {e}")
+            return None
+
+    def sleep_stages_yasa(self,
+                          eog_channels=None,
+                          create_bipolar_eog=True,
+                          metadata=None):
+        """
+        使用 YASA 进行自动睡眠分期。
+
+        YASA 标准输入要求:
+          - eeg_name: 中央区 EEG 导联 (如 C3-M2, 这里用 E21 近似 Cz)
+          - eog_name: 眼电导联 (提高 Wake/REM 判别准确率)
+          - emg_name: 颏肌电导联 (EGI 256导无此导联, 跳过)
+
+        EGI 256导中眼电对应导联 (基于坐标分析, z≈0, |x|最大):
+          - 左眼区域: E67 (x=-0.077, z=-0.003)  /  E68 (x=-0.077, z=0.015)
+          - 右眼区域: E219 (x=+0.077, z=-0.003) / E210 (x=+0.077, z=0.015)
+          默认创建双极导联 EOG = E67 - E219
+
+        Args:
+            eog_channels: 自定义眼电通道对 (left, right), None 使用默认 E67/E219
+            create_bipolar_eog: 是否创建双极 EOG 导联
+            metadata: 可选元数据 dict, 如 {'age': 30, 'male': 0}
+
+        Returns:
+            睡眠分期数组 (0=Wake, 1=N1, 2=N2, 3=N3, 4=REM)
+        """
+        try:
+            # ---- 确定眼电通道 ----
+            if eog_channels is None:
+                eog_channels = ('E67', 'E219')  # 基于坐标的最前外侧导联
+
+            eog_left, eog_right = eog_channels
+
+            # 验证通道存在
+            for ch in [eog_left, eog_right]:
+                if ch not in self.raw.ch_names:
+                    print(f"[YASA] 警告: EOG 候选通道 {ch} 不存在, 仅使用 EEG")
+                    create_bipolar_eog = False
+                    break
+
+            # ---- 准备 Raw 对象 (含双极 EOG) ----
+            if create_bipolar_eog:
+                # 创建双极 EOG: left - right (捕获水平眼动)
+                eog_data = (self.raw.get_data(picks=[eog_left])[0] -
+                            self.raw.get_data(picks=[eog_right])[0])
+                eeg_data = self.raw.get_data(picks=[self.eeg_channel])[0]
+                # 组合为双通道 RawArray
+                combined_data = np.vstack([eeg_data, eog_data])
+                combined_info = mne.create_info(
+                    [self.eeg_channel, 'EOG'],
+                    sfreq=self.raw.info['sfreq'],
+                    ch_types=['eeg', 'eog']
+                )
+                raw_stage = mne.io.RawArray(combined_data, combined_info)
+                eog_arg = 'EOG'
+            else:
+                raw_stage = self.raw.copy().pick([self.eeg_channel])
+                eog_arg = None
+            sls = yasa.SleepStaging(
+                raw_stage,
+                eeg_name=self.eeg_channel,
+                eog_name=eog_arg,
+                metadata=metadata,
+            )
+            hypno_pred = sls.predict()
+
+            # ---- 统计分期比例 ----
+            labels = {0: 'Wake', 1: 'N1', 2: 'N2', 3: 'N3', 4: 'REM'}
+            stage_counts = {labels.get(s, s): (hypno_pred == s).sum()
+                            for s in np.unique(hypno_pred)}
+            total = len(hypno_pred)
+            stage_pct = {k: f'{v/total*100:.1f}%' for k, v in stage_counts.items()}
+
+            self.features['sleep_stages'] = {
+                'stages': hypno_pred,
+                'stage_labels': labels,
+                'stage_counts': stage_counts,
+                'stage_pct': stage_pct,
+                'epoch_length': 30,
+                'total_epochs': len(hypno_pred),
+                'eeg_channel': self.eeg_channel,
+                'eog_channels': eog_channels if create_bipolar_eog else None,
+            }
+            print(f"睡眠分期完成: {stage_pct}")
+            return hypno_pred
+
+        except Exception as e:
+            print(f"睡眠分期提取失败: {e}")
+            return None
+
+    # ================================================================
+    #  Part 2 — 频率域特征
+    # ================================================================
+
+    def psd(self, win_sec: float = 6):
+        """
+        使用 mne_features 提取频带归一化功率 (delta/theta/alpha/beta/gamma)。
+
+        Args:
+            win_sec: 滑动窗口长度（秒）
+
+        Returns:
+            dict with psd_features shape (n_windows, n_bands)
+        """
+        try:
+            sfreq = self.sfreq
+            data = self.data
+            if data.ndim == 1:
+                data = data[np.newaxis, :]
+
+            win_samples = int(win_sec * sfreq)
+            n_times = data.shape[1]
+            n_windows = n_times // win_samples
+            if n_windows < 1:
+                print("[psd] 数据长度不足一个窗口")
+                return None
+
+            psd_features = []
+            for w in range(n_windows):
+                seg = data[:, w * win_samples:(w + 1) * win_samples]
+                feat = compute_pow_freq_bands(
+                    sfreq=sfreq, data=seg, freq_bands=self.BAND_EDGES,
+                    normalize=True, log=False,
+                    psd_method='welch', psd_params=None)
+                psd_features.append(feat)
+
+            psd_features = np.array(psd_features)
+            result = {
+                'win_sec': win_sec, 'n_windows': n_windows,
+                'band_names': self.BAND_NAMES,
+                'psd_features': psd_features, 'shape': psd_features.shape
+            }
+            self.features['psd'] = result
+            self._epoch_info['psd'] = {'n_epochs': n_windows, 'epoch_sec': win_sec}
+            print("功率谱计算完成")
+            return result
+        except Exception as e:
+            print(f"能量谱提取失败: {e}")
+            return None
+
+    def spectral_entropy(self, win_sec: float = 30, fmin: float = 0.3,
+                         fmax: float = 35.0):
+        """
+        计算频谱熵 (Spectral Entropy)，每个 epoch 一个值。
+
+        Args:
+            win_sec: epoch 长度（秒）
+            fmin, fmax: 频率范围 (Hz) —— 修复：实际应用频带限制
+
+        Returns:
+            ndarray shape (n_epochs,)
+        """
+        sfreq = self.sfreq
+        data = self.data
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+
+        epoch_samples = int(win_sec * sfreq)
+        n_times = data.shape[1]
+        n_epochs = n_times // epoch_samples
+        if n_epochs == 0:
+            print("[Spectral Entropy] 数据长度不足")
+            return None
+
+        se_values = np.zeros(n_epochs)
+        print(f"[Spectral Entropy] 计算 {n_epochs} 个 epoch 的频谱熵...")
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Spectral Entropy")
+
+        for ep in iterator:
+            seg = data[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                se = compute_spect_entropy(sfreq=sfreq, data=seg,
+                                           psd_method='welch')
+                se_values[ep] = se[0] if isinstance(se, np.ndarray) else se
+            except Exception:
+                se_values[ep] = np.nan
+
+        self._store_feature('spectral_entropy', se_values,
+                            {'epoch_sec': win_sec, 'fmin': fmin, 'fmax': fmax})
+        print("频谱熵计算完成")
+        return se_values
+
+    # ================================================================
+    #  Part 3 — 时域特征 (Hjorth, 统计量)
+    # ================================================================
+
+    def hjorth_mobility(self, epoch_sec: float = 30):
+        """Hjorth Mobility（每 epoch）。"""
+        data = self.filted
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+        n_epochs = self._get_n_epochs(epoch_sec)
+        if n_epochs == 0:
+            return None
+        epoch_samples = int(epoch_sec * self.sfreq)
+
+        mobility = np.zeros(n_epochs)
+        for ep in range(n_epochs):
+            seg = data[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                mobility[ep] = compute_hjorth_mobility(seg)[0]
+            except Exception:
+                mobility[ep] = np.nan
+
+        self._store_feature('hjorth_mobility', mobility,
+                            {'epoch_sec': epoch_sec})
+        print("Hjorth Mobility 计算完成")
+        return mobility
+
+    def hjorth_complexity(self, epoch_sec: float = 30):
+        """Hjorth Complexity（每 epoch）。"""
+        data = self.filted
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+        n_epochs = self._get_n_epochs(epoch_sec)
+        if n_epochs == 0:
+            return None
+        epoch_samples = int(epoch_sec * self.sfreq)
+
+        complexity = np.zeros(n_epochs)
+        for ep in range(n_epochs):
+            seg = data[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                complexity[ep] = compute_hjorth_complexity(seg)[0]
+            except Exception:
+                complexity[ep] = np.nan
+
+        self._store_feature('hjorth_complexity', complexity,
+                            {'epoch_sec': epoch_sec})
+        print("Hjorth Complexity 计算完成")
+        return complexity
+
+    def statistical_features(self, epoch_sec: float = 30):
+        """
+        统计特征：均值、方差、偏度、峰度、RMS、线长、过零率。
+
+        Returns:
+            dict of ndarrays, each shape (n_epochs,)
+        """
+        data = self.data
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+        n_epochs = self._get_n_epochs(epoch_sec)
+        if n_epochs == 0:
+            return None
+        epoch_samples = int(epoch_sec * self.sfreq)
+
+        results = {
+            'mean': np.zeros(n_epochs),
+            'variance': np.zeros(n_epochs),
+            'skewness': np.zeros(n_epochs),
+            'kurtosis': np.zeros(n_epochs),
+            'rms': np.zeros(n_epochs),
+            'line_length': np.zeros(n_epochs),
+            'zero_crossing_rate': np.zeros(n_epochs),
+        }
+
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Statistical Features")
+
+        for ep in iterator:
+            seg = data[0, ep * epoch_samples:(ep + 1) * epoch_samples]
+            results['mean'][ep] = np.mean(seg)
+            results['variance'][ep] = np.var(seg)
+            results['skewness'][ep] = stats.skew(seg)
+            results['kurtosis'][ep] = stats.kurtosis(seg)
+            results['rms'][ep] = np.sqrt(np.mean(seg ** 2))
+            results['line_length'][ep] = np.sum(np.abs(np.diff(seg)))
+            results['zero_crossing_rate'][ep] = np.sum(np.diff(np.signbit(seg)) != 0) / len(seg)
+
+        self.features['statistical'] = {
+            'values': results,
+            'meta': {'epoch_sec': epoch_sec}
+        }
+        print("统计特征计算完成")
+        return results
+
+    # ================================================================
+    #  Part 4 — 非线性特征: 熵
+    # ================================================================
+
+    def sample_entropy(self, epoch_sec: float = 30):
+        """Sample Entropy（每 epoch）。需要 antropy 库。"""
+        if not HAS_ANTROPY:
+            print("[Sample Entropy] antropy 未安装")
+            return None
+        return self._entropy_wrapper(ant.sample_entropy, 'sample_entropy', epoch_sec)
+
+    def permutation_entropy(self, epoch_sec: float = 30, order: int = 3, delay: int = 1):
+        """Permutation Entropy（每 epoch）。"""
+        if not HAS_ANTROPY:
+            print("[Permutation Entropy] antropy 未安装")
+            return None
+        values = np.zeros(self._get_n_epochs(epoch_sec))
+        epoch_samples = int(epoch_sec * self.sfreq)
+        data = self.data.ravel()
+        iterator = range(len(values))
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Permutation Entropy")
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                values[ep] = ant.perm_entropy(seg, order=order, delay=delay)
+            except Exception:
+                values[ep] = np.nan
+        self._store_feature('permutation_entropy', values,
+                            {'epoch_sec': epoch_sec, 'order': order})
+        print("Permutation Entropy 计算完成")
+        return values
+
+    def approximate_entropy(self, epoch_sec: float = 30):
+        """Approximate Entropy（每 epoch）。"""
+        if not HAS_ANTROPY:
+            return None
+        return self._entropy_wrapper(ant.app_entropy, 'approximate_entropy', epoch_sec)
+
+    def _entropy_wrapper(self, func, name: str, epoch_sec: float):
+        """通用熵计算包装器。"""
+        values = np.zeros(self._get_n_epochs(epoch_sec))
+        epoch_samples = int(epoch_sec * self.sfreq)
+        data = self.data.ravel()
+        iterator = range(len(values))
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc=name.replace('_', ' ').title())
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                values[ep] = func(seg)
+            except Exception:
+                values[ep] = np.nan
+        self._store_feature(name, values, {'epoch_sec': epoch_sec})
+        print(f"{name} 计算完成")
+        return values
+
+    # ================================================================
+    #  Part 5 — 非线性特征: 复杂度 & 分形
+    # ================================================================
+
+    def lempel_ziv_complexity(self, epoch_sec: float = 30, normalize: bool = True):
+        """
+        Lempel-Ziv 复杂度（需要二值化后再计算）。
+
+        使用 antropy.lziv_complexity。先将信号二值化（以中位数为界）。
+        """
+        if not HAS_ANTROPY:
+            print("[LZ Complexity] antropy 未安装")
+            return None
+        values = np.zeros(self._get_n_epochs(epoch_sec))
+        epoch_samples = int(epoch_sec * self.sfreq)
+        data = self.data.ravel()
+        iterator = range(len(values))
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Lempel-Ziv Complexity")
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                binary = (seg > np.median(seg)).astype(int)
+                values[ep] = ant.lziv_complexity(binary, normalize=normalize)
+            except Exception:
+                values[ep] = np.nan
+        self._store_feature('lz_complexity', values,
+                            {'epoch_sec': epoch_sec, 'normalize': normalize})
+        print("Lempel-Ziv Complexity 计算完成")
+        return values
+
+    def higuchi_fractal_dimension(self, epoch_sec: float = 30, kmax: int = 10):
+        """Higuchi 分形维数（每 epoch）。"""
+        if not HAS_ANTROPY:
+            return None
+        values = np.zeros(self._get_n_epochs(epoch_sec))
+        epoch_samples = int(epoch_sec * self.sfreq)
+        data = self.data.ravel()
+        iterator = range(len(values))
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Higuchi FD")
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                values[ep] = ant.higuchi_fd(seg, kmax=kmax)
+            except Exception:
+                values[ep] = np.nan
+        self._store_feature('higuchi_fd', values,
+                            {'epoch_sec': epoch_sec, 'kmax': kmax})
+        print("Higuchi Fractal Dimension 计算完成")
+        return values
+
+    def dfa(self, epoch_sec: float = 30):
+        """
+        Detrended Fluctuation Analysis (DFA) 指数（每 epoch）。
+        需要 neurokit2 库。
+
+        Returns:
+            ndarray shape (n_epochs,)
+        """
+        if not HAS_NEUROKIT2:
+            print("[DFA] neurokit2 未安装")
+            return None
+        values = np.zeros(self._get_n_epochs(epoch_sec))
+        epoch_samples = int(epoch_sec * self.sfreq)
+        data = self.data.ravel()
+        iterator = range(len(values))
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="DFA")
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                result = nk.fractal_dfa(seg)
+                # neurokit2 >= 0.2.0 returns tuple (alpha, info_dict)
+                if isinstance(result, tuple):
+                    values[ep] = result[0]
+                else:
+                    values[ep] = result['dfa_alpha'].iloc[0]
+            except Exception:
+                values[ep] = np.nan
+        self._store_feature('dfa', values, {'epoch_sec': epoch_sec})
+        print("DFA 计算完成")
+        return values
+
+    # ================================================================
+    #  Part 6 — pycatch22: 22 维规范时序特征
+    # ================================================================
+
+    def catch22_features(self, epoch_sec: float = 30):
+        """
+        pycatch22 — 22 个规范时序特征（每 epoch）。
+        返回 shape (n_epochs, 22)。
+        """
+        values = np.zeros((self._get_n_epochs(epoch_sec), 22))
+        epoch_samples = int(epoch_sec * self.sfreq)
+        data = self.data.ravel()
+        iterator = range(values.shape[0])
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="catch22")
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                vals = pycatch22.catch22_all(seg)
+                # catch22_all returns {'names': [...], 'values': [...]}
+                values[ep] = vals['values']
+            except Exception:
+                values[ep] = np.nan
+        self._store_feature('catch22', values, {'epoch_sec': epoch_sec})
+        print("catch22 特征计算完成")
+        return values
+
+    # ================================================================
+    #  Part 7 — 时频特征: 子波
+    # ================================================================
+
+    def wavelet_features(self, epoch_sec: float = 30,
+                         freqs=None, n_cycles: int = 5):
+        """
+        基于 Morlet 小波的各频带平均能量。
+
+        Args:
+            epoch_sec: epoch 长度
+            freqs: 频率列表，默认 2-40 Hz 对数分布
+            n_cycles: 小波周期数
+
+        Returns:
+            dict: {band_name: array of shape (n_epochs,)}
+        """
+        if freqs is None:
+            freqs = np.logspace(np.log10(2), np.log10(40), 20)
+
+        data = self.data
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+
+        n_epochs = self._get_n_epochs(epoch_sec)
+        if n_epochs == 0:
+            return None
+        epoch_samples = int(epoch_sec * self.sfreq)
+
+        result = {band: np.zeros(n_epochs) for band in self.BAND_NAMES}
+        band_masks = {}
+        for band, (fl, fh) in self.FREQ_BANDS.items():
+            band_masks[band] = (freqs >= fl) & (freqs <= fh)
+
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Wavelet Features")
+
+        for ep in iterator:
+            seg = data[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+            try:
+                # 使用 mne 的 tfr_array_morlet
+                power = mne.time_frequency.tfr_array_morlet(
+                    seg[np.newaxis, :, :], sfreq=self.sfreq,
+                    freqs=freqs, n_cycles=n_cycles,
+                    output='power', verbose=False)
+                power = power[0, 0]  # (n_freqs, n_times)
+                avg_power = power.mean(axis=1)  # 时间平均
+                for band in self.BAND_NAMES:
+                    mask = band_masks[band]
+                    if mask.any():
+                        result[band][ep] = avg_power[mask].mean()
+            except Exception:
+                for band in self.BAND_NAMES:
+                    result[band][ep] = np.nan
+
+        self.features['wavelet'] = {
+            'values': result,
+            'meta': {'epoch_sec': epoch_sec, 'freqs': freqs}
+        }
+        print("子波特征计算完成")
+        return result
+
+    # ================================================================
+    #  Part 8 — IRASA & 非周期特征
+    # ================================================================
+
+    def _irasa(self, data_1ch_uv: np.ndarray):
+        """
+        使用 yasa.irasa 分离振荡/非周期成分。
+
+        data_1ch_uv: 1D 数组，单位 μV
+
+        Returns:
+            (freqs, psd_aperiodic, psd_oscillatory) 或 (None, None, None)
+        """
+        try:
+            if data_1ch_uv.ndim == 2:
+                if data_1ch_uv.shape[0] == 1:
+                    data_1ch_uv = data_1ch_uv.ravel()
+                else:
+                    data_1ch_uv = data_1ch_uv[0]
+
+            # 去直流
+            data_1ch_uv = data_1ch_uv - np.mean(data_1ch_uv)
+
+            # 清洗 inf/nan
+            if np.any(~np.isfinite(data_1ch_uv)):
+                print("[WARN] 数据包含 inf 或 nan，尝试修复...")
+                data_1ch_uv = np.nan_to_num(
+                    data_1ch_uv, nan=np.nanmedian(data_1ch_uv),
+                    posinf=np.nanmedian(data_1ch_uv),
+                    neginf=np.nanmedian(data_1ch_uv))
+                if np.any(~np.isfinite(data_1ch_uv)):
+                    return None, None, None
+
+            if np.var(data_1ch_uv) < 1e-10:
+                print("[WARN] 数据方差为零，跳过 IRASA")
+                return None, None, None
+
+            out = yasa.irasa(
+                data=data_1ch_uv,
+                sf=self.sfreq,
+                ch_names=[self.eeg_channel],
+                band=(0.3, 35),
+                hset=[1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45,
+                      1.5, 1.55, 1.6, 1.65, 1.7, 1.75, 1.8, 1.85],
+                return_fit=True,
+                win_sec=4,
+                verbose=False,
+            )
+            return out[0], out[1], out[2]
+        except Exception as e:
+            print(f"[WARN] IRASA failed: {e}")
+            return None, None, None
+
+    def aperiodic(self, epoch_sec: float = 30,
+                  fit_band: tuple = (0.3, 35.0),
+                  min_valid_bins: int = 3):
+        """
+        非周期斜率 (1/f^β) — 每 epoch 做 IRASA → log-log 线性拟合。
+
+        Returns:
+            dict with 'records', 'slope_per_epoch', 'beta_per_epoch'
+        """
+        data = self.data.ravel()
+        sf = self.sfreq
+        epoch_samples = int(epoch_sec * sf)
+        n_epochs = len(data) // epoch_samples
+        if n_epochs < 1:
+            print("[aperiodic] 数据太短")
+            return None
+
+        rec = []
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Aperiodic (IRASA)")
+
+        for k in iterator:
+            seg = data[k * epoch_samples:(k + 1) * epoch_samples]
+            if np.any(~np.isfinite(seg)):
+                rec.append({"epoch": k, "slope_loglog": np.nan,
+                            "beta": np.nan, "ok": False})
+                continue
+
+            freqs, psd_ap, _ = self._irasa(seg)
+            if freqs is None or psd_ap is None:
+                rec.append({"epoch": k, "slope_loglog": np.nan,
+                            "beta": np.nan, "intercept_loglog": np.nan,
+                            "ok": False})
+                continue
+
+            psd_ap = np.asarray(psd_ap).ravel()
+            f, p = np.asarray(freqs), psd_ap
+            mask = ((f > 0) & np.isfinite(f) & np.isfinite(p) & (p > 0))
+            lo, hi = fit_band
+            mask &= (f >= lo) & (f <= hi)
+
+            if mask.sum() < min_valid_bins:
+                rec.append({"epoch": k, "slope_loglog": np.nan,
+                            "beta": np.nan, "ok": False})
+                continue
+
+            X = np.log10(f[mask])
+            Y = np.log10(p[mask])
+            (b, a), *_ = np.linalg.lstsq(
+                np.column_stack([np.ones_like(X), X]), Y, rcond=None)
+            rec.append(dict(epoch=k, slope_loglog=b, beta=-b,
+                            intercept_loglog=a, fit_lo=lo, fit_hi=hi, ok=True))
+
+        out = {
+            "epoch_sec": epoch_sec,
+            "fit_band": fit_band,
+            "records": rec,
+            "slope_per_epoch": np.array([r["slope_loglog"] for r in rec]),
+            "beta_per_epoch": np.array([r["beta"] for r in rec]),
+        }
+        self.features['aperiodic'] = out
+        print("非周期特征计算完成")
+        return out
+
+    # ================================================================
+    #  Part 8B — tsfresh 大规模特征提取 (hctsa 风格)
+    #  Ref: "Beyond traditional sleep scoring: Massive feature extraction
+    #        and data-driven clustering of sleep time series"
+    # ================================================================
+
+    def tsfresh_features(self, epoch_sec: float = 30,
+                          n_jobs: int = 1,
+                          fc_parameters: dict = None):
+        """
+        使用 tsfresh 对每个 epoch 提取大规模时间序列特征。
+        这是 hctsa 最接近的 Python 等价物 —— 单通道可得 700+ 维特征。
+
+        Args:
+            epoch_sec: epoch 长度
+            n_jobs: 并行作业数 (1 = 单线程)
+            fc_parameters: tsfresh 特征参数配置；
+                           None = 使用 EfficientFCParameters (精简集 ~200 个特征)
+                           可传入 ComprehensiveFCParameters 获得完整 ~700 个特征
+
+        Returns:
+            pd.DataFrame: 每行一个 epoch，列为特征名
+        """
+        try:
+            from tsfresh.feature_extraction import extract_features, EfficientFCParameters, ComprehensiveFCParameters
+        except ImportError:
+            print("[tsfresh] tsfresh 未安装，请: pip install tsfresh")
+            return None
+
+        if fc_parameters is None:
+            fc_parameters = EfficientFCParameters()
+
+        data = self.data.ravel()
+        sf = self.sfreq
+        epoch_samples = int(epoch_sec * sf)
+        n_epochs = len(data) // epoch_samples
+        if n_epochs < 1:
+            print("[tsfresh] 数据太短")
+            return None
+
+        # 构建 tsfresh 所需的 DataFrame 格式
+        import pandas as pd
+        from tqdm import tqdm as _tqdm
+
+        # 逐 epoch 提取 —— tsfresh 对单段时间序列效果最好
+        all_features = []
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = _tqdm(iterator, desc="tsfresh Features")
+
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            if np.any(~np.isfinite(seg)):
+                # 填充 NaN
+                all_features.append(None)
+                continue
+
+            # tsfresh 期望 (time_index, kind, value) 格式
+            df_ts = pd.DataFrame({
+                'id': ['ch0'] * len(seg),
+                'time': np.arange(len(seg)),
+                'value': seg.astype(np.float64),
+            })
+
+            try:
+                feats = extract_features(
+                    df_ts, column_id='id', column_sort='time',
+                    default_fc_parameters=fc_parameters,
+                    n_jobs=n_jobs, disable_progressbar=True,
+                )
+                all_features.append(feats)
+            except Exception:
+                all_features.append(None)
+
+        # 合并所有 epoch 的特征
+        valid_epochs = [i for i, f in enumerate(all_features) if f is not None]
+        if not valid_epochs:
+            print("[tsfresh] 没有有效 epoch")
+            return None
+
+        # 对齐列（tsfresh 对不同数据可能返回不同列）
+        all_cols = set()
+        for f in all_features:
+            if f is not None:
+                all_cols.update(f.columns)
+        all_cols = sorted(all_cols)
+
+        feat_matrix = np.full((n_epochs, len(all_cols)), np.nan)
+        for i, f in enumerate(all_features):
+            if f is not None:
+                for j, col in enumerate(all_cols):
+                    if col in f.columns:
+                        feat_matrix[i, j] = f[col].values[0]
+
+        self.features['tsfresh'] = {
+            'values': feat_matrix,
+            'meta': {
+                'epoch_sec': epoch_sec,
+                'n_features': len(all_cols),
+                'feature_names': all_cols,
+            }
+        }
+        print(f"tsfresh 特征提取完成: {len(all_cols)} 个特征 × {n_epochs} 个epoch")
+        return feat_matrix
+
+    # ================================================================
+    #  Part 8C — 递归定量分析 (RQA)
+    # ================================================================
+
+    def rqa_features(self, epoch_sec: float = 30,
+                     embedding_dim: int = 3,
+                     time_delay: int = 1,
+                     threshold: float = 0.1,
+                     min_diag_line: int = 2,
+                     min_vert_line: int = 2,
+                     decimate_factor: int = 5):
+        """
+        递归定量分析 (Recurrence Quantification Analysis)。
+
+        计算每个 epoch 的 RQA 指标:
+        - RR: 递归率 (Recurrence Rate)
+        - DET: 确定性 (Determinism)
+        - LAM: 层流性 (Laminarity)
+        - L_max: 最大对角线长度
+        - L_mean: 平均对角线长度
+        - TT: 捕获时间 (Trapping Time)
+        - ENTR: 香农熵 (对角线长度分布)
+
+        Args:
+            epoch_sec: epoch 长度
+            embedding_dim: 嵌入维度
+            time_delay: 时间延迟
+            threshold: 递归阈值 (相对最大距离的比例)
+            min_diag_line: 最小对角线长度
+            min_vert_line: 最小垂直线长度
+            decimate_factor: 降采样因子 (默认5, 即 250→50 Hz, 大幅加速)
+
+        Returns:
+            dict: 各 RQA 指标的 epoch 序列
+        """
+        data = self.data.ravel()
+        sf = self.sfreq
+        epoch_samples = int(epoch_sec * sf)
+        n_epochs = len(data) // epoch_samples
+        if n_epochs < 1:
+            print("[RQA] 数据太短")
+            return None
+
+        # 降采样
+        if decimate_factor > 1:
+            effective_sf = sf // decimate_factor
+        else:
+            effective_sf = sf
+
+        results = {
+            'RR': np.zeros(n_epochs),
+            'DET': np.zeros(n_epochs),
+            'LAM': np.zeros(n_epochs),
+            'L_max': np.zeros(n_epochs),
+            'L_mean': np.zeros(n_epochs),
+            'TT': np.zeros(n_epochs),
+            'ENTR': np.zeros(n_epochs),
+        }
+
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="RQA Features")
+
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            # 降采样
+            if decimate_factor > 1:
+                seg = seg[::decimate_factor]
+
+            if np.any(~np.isfinite(seg)):
+                for k in results:
+                    results[k][ep] = np.nan
+                continue
+
+            try:
+                rqa = self._compute_rqa(
+                    seg, embedding_dim, time_delay, threshold,
+                    min_diag_line, min_vert_line)
+                for k, v in rqa.items():
+                    results[k][ep] = v
+            except Exception:
+                for k in results:
+                    results[k][ep] = np.nan
+
+        self.features['rqa'] = {
+            'values': results,
+            'meta': {
+                'epoch_sec': epoch_sec,
+                'embedding_dim': embedding_dim,
+                'time_delay': time_delay,
+                'threshold': threshold,
+                'decimate_factor': decimate_factor,
+            }
+        }
+        print("RQA 特征计算完成")
+        return results
+
+    @staticmethod
+    def _compute_rqa(seg: np.ndarray, emb_dim: int, delay: int,
+                     threshold: float, min_diag: int, min_vert: int) -> dict:
+        """计算单个 epoch 的 RQA 指标。"""
+        # Step 1: 相空间重构 (time-delay embedding)
+        n = len(seg) - (emb_dim - 1) * delay
+        if n < 10:
+            return {k: np.nan for k in ['RR', 'DET', 'LAM', 'L_max', 'L_mean', 'TT', 'ENTR']}
+
+        embedded = np.zeros((n, emb_dim))
+        for d in range(emb_dim):
+            embedded[:, d] = seg[d * delay:d * delay + n]
+
+        # Step 2: 计算距离矩阵
+        from scipy.spatial.distance import pdist, squareform
+        dist = squareform(pdist(embedded, metric='euclidean'))
+        max_dist = dist.max()
+        if max_dist == 0:
+            return {k: np.nan for k in ['RR', 'DET', 'LAM', 'L_max', 'L_mean', 'TT', 'ENTR']}
+
+        # Step 3: 构建递归矩阵 (二值化)
+        epsilon = threshold * max_dist
+        rm = (dist <= epsilon).astype(np.int8)
+        np.fill_diagonal(rm, 0)  # 排除自递归
+
+        # Step 4: 计算 RQA 指标
+        N = rm.shape[0]
+        total_pairs = N * (N - 1)  # 上三角不含对角线
+        rec_points = np.sum(rm)
+        RR = rec_points / total_pairs if total_pairs > 0 else 0.0
+
+        # 对角线结构
+        diag_hist = {}
+        for k in range(-(N - 1), N):
+            if k == 0:
+                continue
+            d = np.diag(rm, k=k)
+            # 找连续1的游程
+            runs = np.diff(np.concatenate(([0], d, [0])))
+            starts = np.where(runs == 1)[0]
+            ends = np.where(runs == -1)[0]
+            lengths = ends - starts
+            for L in lengths[lengths >= min_diag]:
+                diag_hist[L] = diag_hist.get(L, 0) + 1
+
+        # 垂直线结构
+        vert_hist = {}
+        for j in range(N):
+            col = rm[:, j]
+            runs = np.diff(np.concatenate(([0], col, [0])))
+            starts = np.where(runs == 1)[0]
+            ends = np.where(runs == -1)[0]
+            lengths = ends - starts
+            for L in lengths[lengths >= min_vert]:
+                vert_hist[L] = vert_hist.get(L, 0) + 1
+
+        # DET, L_max, L_mean, ENTR
+        total_diag = sum(diag_hist.values())
+        if total_diag > 0:
+            DET = total_diag / rec_points if rec_points > 0 else 0.0
+            L_max = max(diag_hist.keys()) if diag_hist else 0
+            L_mean = sum(L * c for L, c in diag_hist.items()) / total_diag
+            # 香农熵
+            probs = np.array(list(diag_hist.values())) / total_diag
+            ENTR = -np.sum(probs * np.log(probs + 1e-12))
+        else:
+            DET = L_max = L_mean = ENTR = 0.0
+
+        # LAM, TT
+        total_vert = sum(vert_hist.values())
+        if total_vert > 0:
+            LAM = total_vert / rec_points if rec_points > 0 else 0.0
+            TT = sum(L * c for L, c in vert_hist.items()) / total_vert
+        else:
+            LAM = TT = 0.0
+
+        return {
+            'RR': RR, 'DET': DET, 'LAM': LAM,
+            'L_max': L_max, 'L_mean': L_mean,
+            'TT': TT, 'ENTR': ENTR,
+        }
+
+    # ================================================================
+    #  Part 8D — 进阶频谱特征 & 自相关
+    # ================================================================
+
+    def additional_spectral_features(self, epoch_sec: float = 30):
+        """
+        进阶频谱特征: 谱矩、谱边频率、波段功率比。
+
+        Returns:
+            dict with keys: centroid, spread, skewness, kurtosis,
+                            sef50, sef90, sef95, theta_beta_ratio,
+                            delta_alpha_ratio, alpha_beta_ratio
+        """
+        data = self.data.ravel()
+        sf = self.sfreq
+        epoch_samples = int(epoch_sec * sf)
+        n_epochs = len(data) // epoch_samples
+        if n_epochs < 1:
+            return None
+
+        keys = [
+            'centroid', 'spread', 'skewness', 'kurtosis',
+            'sef50', 'sef90', 'sef95',
+            'theta_beta_ratio', 'delta_alpha_ratio', 'alpha_beta_ratio',
+        ]
+        results = {k: np.zeros(n_epochs) for k in keys}
+
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Adv. Spectral")
+
+        bands = self.FREQ_BANDS
+
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            if np.any(~np.isfinite(seg)):
+                for k in keys:
+                    results[k][ep] = np.nan
+                continue
+
+            try:
+                # Welch PSD
+                f, psd = signal.welch(seg, fs=sf, nperseg=min(1024, len(seg)),
+                                      noverlap=min(512, len(seg)//2))
+                mask = (f >= 0.5) & (f <= 40) & (psd > 0)
+                if mask.sum() < 3:
+                    for k in keys:
+                        results[k][ep] = np.nan
+                    continue
+
+                f_m = f[mask]
+                p_m = psd[mask]
+                total_power = np.trapz(p_m, f_m)
+
+                # 谱矩
+                centroid = np.trapz(f_m * p_m, f_m) / total_power
+                spread = np.sqrt(np.trapz((f_m - centroid)**2 * p_m, f_m) / total_power)
+                skew = np.trapz((f_m - centroid)**3 * p_m, f_m) / (total_power * spread**3) if spread > 0 else 0
+                kurt = np.trapz((f_m - centroid)**4 * p_m, f_m) / (total_power * spread**4) if spread > 0 else 0
+
+                # 累积功率 → 谱边频率
+                cumsum = np.cumsum(p_m) / total_power
+                sef50 = f_m[np.searchsorted(cumsum, 0.50)]
+                sef90 = f_m[np.searchsorted(cumsum, 0.90)]
+                sef95 = f_m[np.searchsorted(cumsum, 0.95)]
+
+                # 波段功率和
+                def band_power(fl, fh):
+                    idx = (f_m >= fl) & (f_m <= fh)
+                    return np.trapz(p_m[idx], f_m[idx]) if idx.any() else 1e-12
+
+                bp = {b: band_power(*r) for b, r in bands.items()}
+
+                results['centroid'][ep] = centroid
+                results['spread'][ep] = spread
+                results['skewness'][ep] = skew
+                results['kurtosis'][ep] = kurt
+                results['sef50'][ep] = sef50
+                results['sef90'][ep] = sef90
+                results['sef95'][ep] = sef95
+                results['theta_beta_ratio'][ep] = bp['theta'] / max(bp['beta'], 1e-12)
+                results['delta_alpha_ratio'][ep] = bp['delta'] / max(bp['alpha'], 1e-12)
+                results['alpha_beta_ratio'][ep] = bp['alpha'] / max(bp['beta'], 1e-12)
+
+            except Exception:
+                for k in keys:
+                    results[k][ep] = np.nan
+
+        self.features['adv_spectral'] = {
+            'values': results,
+            'meta': {'epoch_sec': epoch_sec}
+        }
+        print("进阶频谱特征计算完成")
+        return results
+
+    def autocorrelation_features(self, epoch_sec: float = 30,
+                                  max_lag_sec: float = 2.0):
+        """
+        自相关函数 (ACF) 特征: 首个过零点、首个局部极小值、衰减率。
+
+        Args:
+            epoch_sec: epoch 长度
+            max_lag_sec: 最大时滞 (秒)
+
+        Returns:
+            dict: acf_zc (过零点), acf_min (首个最小值), acf_decay (指数衰减率)
+        """
+        data = self.data.ravel()
+        sf = self.sfreq
+        epoch_samples = int(epoch_sec * sf)
+        n_epochs = len(data) // epoch_samples
+        if n_epochs < 1:
+            return None
+
+        max_lag = int(max_lag_sec * sf)
+        keys = ['acf_zc', 'acf_first_min', 'acf_decay',
+                'acf_lag1', 'acf_lag10']
+        results = {k: np.zeros(n_epochs) for k in keys}
+
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="ACF Features")
+
+        for ep in iterator:
+            seg = data[ep * epoch_samples:(ep + 1) * epoch_samples]
+            if np.any(~np.isfinite(seg)):
+                for k in keys:
+                    results[k][ep] = np.nan
+                continue
+
+            try:
+                acf = np.correlate(seg - seg.mean(), seg - seg.mean(), mode='full')
+                acf = acf[len(acf)//2:]  # 只取正滞后
+                acf = acf / max(acf[0], 1e-12)  # 归一化
+                acf_trunc = acf[:min(max_lag, len(acf))]
+
+                # Lag-1, Lag-10 自相关
+                results['acf_lag1'][ep] = acf[1] if len(acf) > 1 else np.nan
+                results['acf_lag10'][ep] = acf[10] if len(acf) > 10 else np.nan
+
+                # 首个过零点
+                zc_idx = np.where(np.diff(np.sign(acf_trunc)) < 0)[0]
+                results['acf_zc'][ep] = zc_idx[0] / sf if len(zc_idx) > 0 else np.nan
+
+                # 首个局部极小值
+                from scipy.signal import argrelextrema
+                minima = argrelextrema(acf_trunc, np.less)[0]
+                results['acf_first_min'][ep] = (minima[0] / sf if len(minima) > 0
+                                                  else np.nan)
+
+                # 指数衰减率 (log|ACF| ~ lag 的线性拟合)
+                valid = (acf_trunc[1:50] > 0.01) if len(acf_trunc) > 50 else (acf_trunc[1:] > 0.01)
+                if valid.sum() >= 5:
+                    lags = np.arange(1, min(51, len(acf_trunc)))
+                    log_acf = np.log(np.maximum(acf_trunc[1:min(51, len(acf_trunc))], 1e-12))
+                    slope, _ = np.polyfit(lags, log_acf, 1)
+                    results['acf_decay'][ep] = -slope
+                else:
+                    results['acf_decay'][ep] = np.nan
+
+            except Exception:
+                for k in keys:
+                    results[k][ep] = np.nan
+
+        self.features['autocorrelation'] = {
+            'values': results,
+            'meta': {'epoch_sec': epoch_sec, 'max_lag_sec': max_lag_sec}
+        }
+        print("自相关特征计算完成")
+        return results
+
+    # ================================================================
+    #  Part 9 — 特征波检测 (SSSM)
+    # ================================================================
+
+    def feature_waves(self, step: int = 300):
+        """
+        使用 SSSM 模型检测特征波（spindle, slow wave 等）。
+        使用 MNE 降采样（含内置 FIR 抗混叠滤波）。
+
+        Args:
+            step: 模型预测步长（样本点）
+
+        Returns:
+            pred_labels: 模型预测标签
+        """
+        try:
+            raw_sssm = self.filted_raw.copy()
+            raw_sssm.resample(100)
+            data_sssm = raw_sssm.get_data(units="uV")
+            model = Model(device='cpu')
+            model.predict(data_sssm, step=step)
+            pred_labels = model.pred
+            window_indices = np.arange(pred_labels.shape[1])  # 窗口索引
+            self.features['feature_waves'] = pred_labels
+            print("特征波提取完成")
+            return pred_labels
+        except Exception as e:
+            print(f"特征波提取失败: {e}")
+            return None
+
+    # ================================================================
+    #  Part 10 — 多通道特征: 功能连接
+    # ================================================================
+
+    def functional_connectivity(self, epoch_sec: float = 30,
+                                methods=('coherence', 'plv', 'correlation'),
+                                use_roi: bool = True, n_rois: int = 25):
+        """
+        多通道功能连接矩阵（每 epoch）。
+
+        Args:
+            epoch_sec: epoch 长度
+            methods: 连接度量方式，可选 'coherence', 'plv', 'pli', 'correlation'
+            use_roi: 是否使用 ROI 聚合模式（默认 True）
+                     True  → 260 通道 → k-means 空间聚类 → n_rois 个脑区
+                     False → 直接使用全部通道（内存/计算量极大）
+            n_rois: ROI 数量（默认 25）
+
+        Returns:
+            dict: {method: ndarray shape (n_epochs, n_ch, n_ch)}
+        """
+        if not self._load_all:
+            print("[Connectivity] 未启用多通道模式，请在 __init__ 设置 load_all_channels=True")
+            return None
+
+        if use_roi:
+            data = self._get_roi_data(n_rois=n_rois, filtered=True)
+        else:
+            data = self._get_filted_all()
+
+        n_ch = data.shape[0]
+        n_epochs = int(data.shape[1] // (epoch_sec * self.sfreq))
+        if n_epochs == 0:
+            return None
+        epoch_samples = int(epoch_sec * self.sfreq)
+
+        label = f"ROI-{n_ch}ch" if use_roi else f"{n_ch}ch"
+        print(f"[Connectivity] {label} 模式: {n_epochs} epochs, {n_ch}×{n_ch} "
+              f"= {n_ch*(n_ch-1)//2} pairs")
+
+        results = {}
+        for method in methods:
+            results[method] = np.zeros((n_epochs, n_ch, n_ch))
+
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc=f"Connectivity ({label})")
+
+        for ep in iterator:
+            seg = data[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+
+            for method in methods:
+                mat = self._connectivity_matrix(seg, method)
+                results[method][ep] = mat
+
+        meta = {'epoch_sec': epoch_sec, 'methods': methods,
+                'use_roi': use_roi, 'n_channels': n_ch}
+        if use_roi:
+            meta['roi_groups'] = self._roi_groups
+        self.features['connectivity'] = {'values': results, 'meta': meta}
+        print("功能连接计算完成")
+        return results
+
+    def _connectivity_matrix(self, data: np.ndarray, method: str):
+        """
+        计算连接矩阵。
+
+        Args:
+            data: shape (n_channels, n_times)
+            method: 'coherence', 'plv', 'pli', 'correlation'
+
+        Returns:
+            ndarray shape (n_ch, n_ch)
+        """
+        n_ch = data.shape[0]
+        mat = np.zeros((n_ch, n_ch))
+
+        if method == 'correlation':
+            corr = np.corrcoef(data)
+            mat = corr
+            np.fill_diagonal(mat, 0)
+            return mat
+
+        # 频域方法需要 PSD / 交叉谱
+        for i in range(n_ch):
+            for j in range(i + 1, n_ch):
+                if method == 'coherence':
+                    f, cxy = signal.coherence(data[i], data[j],
+                                              fs=self.sfreq, nperseg=min(256, len(data[i]) // 2))
+                    mat[i, j] = mat[j, i] = np.mean(cxy[(f >= 0.5) & (f <= 40)])
+                elif method == 'plv':
+                    mat[i, j] = mat[j, i] = self._plv(data[i], data[j])
+                elif method == 'pli':
+                    mat[i, j] = mat[j, i] = self._pli(data[i], data[j])
+        return mat
+
+    @staticmethod
+    def _plv(x, y):
+        """Phase Locking Value。"""
+        xa = signal.hilbert(x)
+        ya = signal.hilbert(y)
+        phase_diff = np.angle(xa) - np.angle(ya)
+        return np.abs(np.mean(np.exp(1j * phase_diff)))
+
+    @staticmethod
+    def _pli(x, y):
+        """Phase Lag Index。"""
+        xa = signal.hilbert(x)
+        ya = signal.hilbert(y)
+        phase_diff = np.angle(xa) - np.angle(ya)
+        return np.abs(np.mean(np.sign(phase_diff)))
+
+    # ================================================================
+    #  Part 11 — 多通道特征: 微状态
+    # ================================================================
+
+    def microstate_analysis(self, n_states: int = 4, gfp_peaks: bool = True):
+        """
+        微状态分析。
+
+        使用 mne_microstates 对全通道 GFP 峰值处的拓扑进行聚类，
+        提取微状态序列和指标。
+
+        Args:
+            n_states: 微状态数量
+            gfp_peaks: 是否仅在 GFP 峰值处拟合
+
+        Returns:
+            dict with segmentation, metrics
+        """
+        if not self._load_all:
+            print("[Microstates] 未启用多通道模式")
+            return None
+
+        try:
+            # 获取滤波后数据并包装为 MNE RawArray
+            data_filt = self._get_filted_all()
+            info = mne.create_info(
+                self.ch_names[:data_filt.shape[0]], self.sfreq,
+                ch_types=['eeg'] * data_filt.shape[0])
+            raw_micro = mne.io.RawArray(data_filt, info, verbose=False)
+            # 使用 mne_microstates 的默认参数
+            from mne_microstates import MicrostateSegmentation
+
+            seg = MicrostateSegmentation(n_states=n_states)
+            seg.fit(raw_micro)
+
+            # 获取微状态序列
+            labels = seg.predict(raw_micro)
+
+            # 计算微状态指标: 覆盖率、持续时长、出现频率、GFP
+            metrics = self._microstate_metrics(labels, n_states)
+
+            result = {
+                'labels': labels,
+                'n_states': n_states,
+                'metrics': metrics,
+            }
+            self.features['microstates'] = result
+            print("微状态分析完成")
+            return result
+        except Exception as e:
+            print(f"微状态分析失败: {e}")
+            return None
+
+    def _microstate_metrics(self, labels: np.ndarray, n_states: int):
+        """计算微状态指标。"""
+        metrics = {}
+        for s in range(n_states):
+            mask = labels == s
+            coverage = mask.mean()
+            # 平均持续时长（转换为秒）
+            transitions = np.diff(mask.astype(int))
+            onset = np.where(transitions == 1)[0] + 1
+            offset = np.where(transitions == -1)[0] + 1
+            if len(onset) > 0 and len(offset) > 0:
+                durations = offset[:min(len(onset), len(offset))] - onset[:min(len(onset), len(offset))]
+                mean_dur = np.mean(durations) / self.sfreq if len(durations) > 0 else 0
+                freq = len(onset) / (len(labels) / self.sfreq / 60)  # per minute
+            else:
+                mean_dur = 0
+                freq = 0
+
+            metrics[f'state_{s}'] = {
+                'coverage': coverage,
+                'mean_duration_s': mean_dur,
+                'frequency_per_min': freq,
+            }
+        return metrics
+
+    # ================================================================
+    #  Part 12 — 多通道特征: 空间
+    # ================================================================
+
+    def global_field_power(self, epoch_sec: float = 30):
+        """
+        全局场功率 (GFP): sqrt(mean(channels^2)) — 每采样点，然后 epoch 平均。
+
+        Returns:
+            ndarray shape (n_epochs,)
+        """
+        if not self._load_all:
+            print("[GFP] 未启用多通道模式")
+            return None
+
+        data = self._get_data_all()  # (n_ch, n_times)
+        # 逐采样点计算 GFP
+        gfp_raw = np.sqrt(np.mean(data ** 2, axis=0))  # (n_times,)
+
+        n_epochs = self._get_n_epochs(epoch_sec)
+        epoch_samples = int(epoch_sec * self.sfreq)
+        gfp_epochs = np.zeros(n_epochs)
+        for ep in range(n_epochs):
+            seg = gfp_raw[ep * epoch_samples:(ep + 1) * epoch_samples]
+            gfp_epochs[ep] = np.mean(seg)
+
+        self._store_feature('gfp', gfp_epochs, {'epoch_sec': epoch_sec})
+        print("Global Field Power 计算完成")
+        return gfp_epochs
+
+    def spatial_complexity(self, epoch_sec: float = 30):
+        """
+        空间复杂度 (Omega Complexity)。
+
+        Omega = exp(-∑ λ_i' * log(λ_i'))，其中 λ_i' 是归一化特征值。
+
+        Returns:
+            ndarray shape (n_epochs,)
+        """
+        if not self._load_all:
+            print("[Spatial Complexity] 未启用多通道模式")
+            return None
+
+        data = self._get_data_all()
+        n_epochs = self._get_n_epochs(epoch_sec)
+        epoch_samples = int(epoch_sec * self.sfreq)
+        omega = np.zeros(n_epochs)
+
+        for ep in range(n_epochs):
+            seg = data[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+            # 协方差矩阵特征值
+            cov = np.cov(seg)
+            eigvals = np.linalg.eigvalsh(cov)
+            eigvals = np.maximum(eigvals, 1e-15)
+            eigvals_norm = eigvals / eigvals.sum()
+            entropy = -np.sum(eigvals_norm * np.log(eigvals_norm))
+            omega[ep] = np.exp(entropy)
+
+        self._store_feature('omega_complexity', omega, {'epoch_sec': epoch_sec})
+        print("空间复杂度计算完成")
+        return omega
+
+    # ================================================================
+    #  Part 13 — 图论特征
+    # ================================================================
+
+    def graph_metrics(self, epoch_sec: float = 30,
+                     use_roi: bool = True, n_rois: int = 25):
+        """
+        图论指标（基于相关矩阵构建图）。
+
+        Args:
+            epoch_sec: epoch 长度
+            use_roi: 是否使用 ROI 聚合模式（默认 True）
+            n_rois: ROI 数量
+
+        Returns:
+            dict with 'degree', 'clustering', 'path_length' per epoch
+        """
+        if not self._load_all or not HAS_NX:
+            if not HAS_NX:
+                print("[Graph Metrics] networkx 未安装")
+            return None
+
+        if use_roi:
+            data = self._get_roi_data(n_rois=n_rois, filtered=False)
+            data_eeg = data
+        else:
+            data = self._get_data_all()
+            eeg_ch_idx = [i for i, ch in enumerate(self.ch_names)
+                          if ch.startswith('E') and ch[1:].isdigit()]
+            data_eeg = data[eeg_ch_idx]
+
+        n_ch = data_eeg.shape[0]
+        label = f"ROI-{n_ch}ch" if use_roi else f"{n_ch}ch"
+        print(f"[Graph] {label} 模式: n_ch={n_ch}")
+        n_epochs = self._get_n_epochs(epoch_sec)
+        epoch_samples = int(epoch_sec * self.sfreq)
+
+        results = {
+            'mean_degree': np.zeros(n_epochs),
+            'mean_clustering': np.zeros(n_epochs),
+            'char_path_length': np.zeros(n_epochs),
+        }
+
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Graph Metrics")
+
+        for ep in iterator:
+            seg = data_eeg[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+            corr = np.corrcoef(seg)
+            corr = np.nan_to_num(corr, nan=0.0)
+            np.fill_diagonal(corr, 0)
+
+            # 二值化: 取 top 20% 的边
+            threshold = np.percentile(np.abs(corr), 80)
+            adj = (np.abs(corr) > threshold).astype(float)
+
+            G = nx.from_numpy_array(adj)
+            try:
+                results['mean_degree'][ep] = np.mean([d for _, d in G.degree()])
+                results['mean_clustering'][ep] = nx.average_clustering(G)
+                # 取最大连通分量计算最短路径 (避免断连图报错)
+                if nx.is_connected(G):
+                    results['char_path_length'][ep] = nx.average_shortest_path_length(G)
+                else:
+                    largest_cc = max(nx.connected_components(G), key=len)
+                    subG = G.subgraph(largest_cc)
+                    results['char_path_length'][ep] = nx.average_shortest_path_length(subG)
+            except Exception:
+                results['mean_degree'][ep] = np.nan
+                results['mean_clustering'][ep] = np.nan
+                results['char_path_length'][ep] = np.nan
+
+        self.features['graph_metrics'] = {
+            'values': results,
+            'meta': {'epoch_sec': epoch_sec}
+        }
+        print("图论指标计算完成")
+        return results
+
+    # ================================================================
+    #  Part 13a — 源定位 (Source Localization)
+    # ================================================================
+    #
+    # 原理:
+    #   头皮EEG是皮层锥体神经元同步突触后电位的容积传导投影。
+    #   源定位通过求解电磁逆问题，从头皮电位反推皮层源活动。
+    #
+    # 工作流:
+    #   fsaverage模板 → BEM头模型 → 前向解(leadfield) → 逆解(MNE/dSPM/eLORETA)
+    #
+    # 方法:
+    #   - MNE: Minimum Norm Estimate, L2正则化最小范数解
+    #   - dSPM: dynamic Statistical Parametric Mapping, 噪声归一化MNE
+    #   - eLORETA: exact Low Resolution Tomography, 零定位误差
+    #
+    # 参考:
+    #   - Gramfort et al. 2013, NeuroImage
+    #   - Pascual-Marqui 2007, arXiv:0710.3341 (eLORETA)
+    #   - Dale et al. 2000, Neuron (dSPM)
+    #   - Hämäläinen & Ilmoniemi 1994, Med Biol Eng Comput (MNE)
+    #
+    # 前置依赖:
+    #   pip install mne  # 需含 fsaverage 模板数据
+    #   首次运行自动下载 fsaverage (~100 MB)
+    #
+    # ────────────────────────────────────────────────────────────
+
+    def source_localization(self, method='eLORETA', epoch_sec=30,
+                            snr=3.0, loose=0.2, depth=0.8):
+        """源定位: 从头皮EEG重建皮层源活动。
+
+        使用 fsaverage 模板 MRI + BEM 头模型 + 逆解。
+
+        Args:
+            method: 逆解方法 'MNE', 'dSPM', 'eLORETA' (推荐 eLORETA)
+            epoch_sec: epoch 长度 (s)
+            snr: 信噪比，用于正则化 (默认 3.0)
+            loose: 源朝向约束 (0=固定朝向, 1=自由朝向, 0.2=宽松)
+            depth: 深度加权 (0=无, 1=全加权, 默认 0.8)
+
+        Returns:
+            dict with 'stc_epochs', 'method', 'src', 'fwd', 'inv_op'
+            stc_epochs: list of SourceEstimate, 每epoch一个
+        """
+        import mne
+        from mne.minimum_norm import (make_inverse_operator,
+                                       apply_inverse)
+        import numpy as np
+
+        print(f"\n[Source Loc] 方法: {method}, epoch={epoch_sec}s")
+        print("[Source Loc] Step 1/5: 设置源空间 (fsaverage)...")
+
+        # ── Step 1: 源空间 ──
+        # fsaverage 是 MNI 标准模板，20484 个顶点/半球
+        # spacing='oct6' → ~4098 src vertices per hemi (可管理的大小)
+        fs_dir = mne.datasets.fetch_fsaverage(verbose=False)
+        subjects_dir = str(Path(fs_dir).parent)
+        src = mne.setup_source_space(
+            'fsaverage', spacing='oct6',
+            subjects_dir=subjects_dir, add_dist=False)
+
+        print(f"[Source Loc] 源空间: {len(src)} 个半球, "
+              f"~{sum(len(s['vertno']) for s in src)} 顶点")
+
+        # ── Step 2: BEM 头模型 ──
+        print("[Source Loc] Step 2/5: 构建 BEM 模型...")
+        conductivity = (0.3,)  # 单层BEM (头皮), EEG可用
+        model = mne.make_bem_model(
+            'fsaverage', ico=4, conductivity=conductivity,
+            subjects_dir=subjects_dir)
+        bem = mne.make_bem_solution(model)
+
+        # ── Step 3: 蒙太奇 + 前向解 ──
+        print("[Source Loc] Step 3/5: 设置电极蒙太奇 + 前向解...")
+        # 使用 EGI 256 标准蒙太奇
+        montage = mne.channels.make_standard_montage('GSN-HydroCel-256')
+        # 用我们的通道名创建 info
+        ch_names_eeg = [ch for ch in self.ch_names
+                        if ch.startswith('E') and ch[1:].isdigit()]
+        info = mne.create_info(ch_names_eeg, self.sfreq, ch_types='eeg')
+        info.set_montage(montage)
+
+        # 估计头-设备变换 (对于模板, 使用自动fiducial对齐)
+        trans = mne.coreg.estimate_head_mri_t(
+            'fsaverage', subjects_dir=subjects_dir)
+
+        # 前向解 (leadfield matrix)
+        fwd = mne.make_forward_solution(
+            info, trans=trans, src=src, bem=bem,
+            meg=False, eeg=True, mindist=5.0, n_jobs=1)
+        print(f"[Source Loc] 前向解: {fwd['nsource']} 源, "
+              f"{fwd['nchan']} 通道")
+
+        # 约束为固定朝向（皮层锥体细胞垂直于皮层表面）
+        fwd = mne.convert_forward_solution(
+            fwd, surf_ori=True, force_fixed=True, copy=False)
+
+        # ── Step 4: 数据准备 + 噪声协方差 ──
+        print("[Source Loc] Step 4/5: 准备 epoch 数据 + 噪声协方差...")
+        # 加载滤波后的全通道数据 → 重塑为 (n_epochs, n_ch, n_times)
+        epoch_samples = int(epoch_sec * self.sfreq)
+        data = self._get_filted_all()
+        n_ch_fwd = data.shape[0]
+        n_epochs = int(data.shape[1] // epoch_samples)
+        data_3d = (data[:, :epoch_samples * n_epochs]
+                   .reshape(n_ch_fwd, n_epochs, epoch_samples)
+                   .transpose(1, 0, 2))
+
+        events = np.column_stack([
+            np.arange(n_epochs, dtype=int),
+            np.zeros(n_epochs, int),
+            np.ones(n_epochs, int)
+        ])
+        epochs = mne.EpochsArray(
+            data_3d, info, events=events, tmin=0,
+            baseline=None, verbose=False)
+
+        # 噪声协方差: 用 shrinkage 方法从数据自身估计
+        noise_cov = mne.compute_covariance(epochs, method='shrunk',
+                                            verbose=False)
+
+        # ── Step 5: 逆解 ──
+        print(f"[Source Loc] Step 5/5: 计算逆解 ({method})...")
+        inv_op = make_inverse_operator(
+            epochs.info, fwd, noise_cov,
+            loose=loose, depth=depth, verbose=False)
+
+        # 逐个 epoch 应用逆解
+        stc_epochs = []
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc=f"Source Loc ({method})")
+
+        for ep in iterator:
+            evoked = epochs[ep].average()
+            stc = apply_inverse(
+                evoked, inv_op, method=method,
+                pick_ori=None, verbose=False)
+            stc_epochs.append(stc)
+
+        print(f"[Source Loc] 完成: {n_epochs} epochs × "
+              f"{len(stc_epochs[0].data)} 源")
+
+        result = {
+            'stc_epochs': stc_epochs,
+            'method': method,
+            'src': src,
+            'fwd': fwd,
+            'inv_op': inv_op,
+            'n_epochs': n_epochs,
+        }
+        self.features['source_localization'] = {'values': result}
+        return result
+
+    def source_band_power(self, epoch_sec=30, method='eLORETA',
+                          bands=None):
+        """源空间频带功率: 在每个源点计算各频带的平均功率。
+
+        Args:
+            epoch_sec: epoch 长度
+            method: 逆解方法
+            bands: dict {name: (low, high)} 或 None (使用默认5频带)
+
+        Returns:
+            dict {band_name: ndarray (n_epochs, n_sources)}
+        """
+        if bands is None:
+            bands = {'delta': (0.5, 4), 'theta': (4, 8),
+                     'alpha': (8, 13), 'beta': (13, 30),
+                     'gamma': (30, 45)}
+
+        # 确保源定位已完成
+        src_result = self.features.get('source_localization', {}).get('values')
+        if src_result is None:
+            print("[Src Band Pwr] 先运行 source_localization()...")
+            src_result = self.source_localization(method=method,
+                                                   epoch_sec=epoch_sec)
+
+        stc_epochs = src_result['stc_epochs']
+        n_epochs = len(stc_epochs)
+        n_sources = stc_epochs[0].data.shape[0]
+        sfreq_stc = stc_epochs[0].sfreq  # MNE stores sampling rate
+
+        results = {name: np.zeros((n_epochs, n_sources))
+                   for name in bands}
+
+        for ep, stc in enumerate(stc_epochs):
+            for band_name, (fl, fh) in bands.items():
+                # 用 STFT 计算频带功率
+                from scipy import signal as scipy_signal
+                freqs, psd = scipy_signal.welch(
+                    stc.data, fs=sfreq_stc, nperseg=min(256, stc.data.shape[1]))
+                band_mask = (freqs >= fl) & (freqs <= fh)
+                band_power = np.trapz(psd[:, band_mask], freqs[band_mask], axis=1)
+                results[band_name][ep] = band_power
+
+        self.features['source_band_power'] = {
+            'values': results,
+            'meta': {'epoch_sec': epoch_sec, 'method': method,
+                     'bands': bands, 'n_sources': n_sources}
+        }
+        print(f"[Src Band Pwr] 完成: {n_epochs} epochs × "
+              f"{len(bands)} bands × {n_sources} sources")
+        return results
+
+    def source_roi_power(self, epoch_sec=30, method='eLORETA',
+                          parc='aparc'):
+        """源空间 ROI 功率: 将源聚合法 Destrieux/Desikan 图谱 ROI。
+
+        Args:
+            epoch_sec: epoch 长度
+            method: 逆解方法
+            parc: 图谱名称 'aparc' (Desikan-Killiany, ~68 ROI)
+                  或 'aparc.a2009s' (Destrieux, ~150 ROI)
+
+        Returns:
+            dict {roi_name: ndarray (n_epochs,)}
+        """
+        import mne
+
+        # 确保源定位已完成
+        src_result = self.features.get('source_localization', {}).get('values')
+        if src_result is None:
+            src_result = self.source_localization(method=method,
+                                                   epoch_sec=epoch_sec)
+
+        stc_epochs = src_result['stc_epochs']
+        src = src_result['src']
+        fs_dir = mne.datasets.fetch_fsaverage(verbose=False)
+        subjects_dir = str(Path(fs_dir).parent)
+
+        # 读取皮层图谱标签
+        labels = mne.read_labels_from_annot(
+            'fsaverage', parc=parc, subjects_dir=subjects_dir)
+
+        print(f"[Src ROI Pwr] {len(labels)} ROIs from {parc}")
+
+        # 对每个 epoch: 每个 ROI 取源点平均
+        roi_names = [l.name for l in labels]
+        results = {name: np.zeros(len(stc_epochs)) for name in roi_names}
+
+        for ep, stc in enumerate(stc_epochs):
+            # 用 extract_label_time_course 批量提取所有ROI时间序列
+            label_ts = mne.extract_label_time_course(
+                stc, labels, src, mode='mean',
+                allow_empty=True, verbose=False)
+            for i, label in enumerate(labels):
+                ts = label_ts[i]
+                if len(ts) > 0 and not np.all(np.isnan(ts)):
+                    results[label.name][ep] = np.sqrt(np.mean(ts ** 2))
+                else:
+                    results[label.name][ep] = np.nan
+
+        self.features['source_roi_power'] = {
+            'values': results,
+            'meta': {'epoch_sec': epoch_sec, 'method': method,
+                     'parc': parc, 'n_rois': len(labels)}
+        }
+        n_valid = sum(1 for v in results.values()
+                      if not np.all(np.isnan(v)))
+        print(f"[Src ROI Pwr] 完成: {n_valid}/{len(labels)} ROIs 非空")
+        return results
+
+    # ══════════════════════════════════════════════════════════
+
+    def run_all(self,
+                epoch_sec: float = 30,
+                groups=('basic', 'time_domain', 'frequency', 'entropy',
+                        'complexity', 'connectivity', 'microstates', 'spatial',
+                        'tsfresh', 'rqa', 'adv_spectral', 'autocorrelation'),
+                skip_yasa: bool = False,
+                skip_sssm: bool = False,
+                skip_source_loc: bool = True,
+                source_method: str = 'eLORETA',
+                yasa_eog_channels=None,
+                yasa_metadata=None):
+        """
+        一键运行全部特征提取。
+
+        Args:
+            epoch_sec: 默认 epoch 长度
+            groups: 要运行的特征组
+                可选: 'basic', 'time_domain', 'frequency', 'entropy',
+                      'complexity', 'connectivity', 'microstates', 'spatial',
+                      'tsfresh', 'rqa', 'adv_spectral', 'autocorrelation'
+            skip_yasa: 是否跳过 YASA 睡眠分期（首次运行需联网下载模型 ~100MB）
+            skip_sssm: 是否跳过 SSSM 特征波检测
+            yasa_eog_channels: YASA 眼电通道对 (left, right), 默认 ('E67', 'E219')
+                EGI 256导中, E67/E219 位于最前外侧 (z≈0, |x|≈0.077), 最接近眼区
+            yasa_metadata: YASA 可选元数据, 如 {'age': 30, 'male': 0}
+        """
+        print(f"\n{'='*60}")
+        print(f"SleepEEGFeatureExtractor — 全特征提取")
+        print(f"文件: {os.path.basename(self.file_path)}")
+        print(f"通道: {self.eeg_channel}, 采样率: {self.sfreq} Hz")
+        print(f"多通道: {'是' if self._load_all else '否'}")
+        print(f"{'='*60}\n")
+
+        # ---- 基础信息 ----
+        if 'basic' in groups:
+            print("\n--- 基础信息 ---")
+            self.recording_date()
+            if not skip_yasa:
+                try:
+                    self.sleep_stages_yasa(
+                        eog_channels=yasa_eog_channels,
+                        metadata=yasa_metadata)
+                except Exception as e:
+                    print(f"YASA 睡眠分期跳过: {e}")
+
+        # ---- 频率域 ----
+        if 'frequency' in groups:
+            print("\n--- 频率域特征 ---")
+            self.psd(win_sec=6)
+            self.spectral_entropy(win_sec=epoch_sec)
+            self.aperiodic(epoch_sec=epoch_sec)
+
+        # ---- 时域 ----
+        if 'time_domain' in groups:
+            print("\n--- 时域特征 ---")
+            self.hjorth_mobility(epoch_sec=epoch_sec)
+            self.hjorth_complexity(epoch_sec=epoch_sec)
+            self.statistical_features(epoch_sec=epoch_sec)
+
+        # ---- 熵 ----
+        if 'entropy' in groups:
+            print("\n--- 熵特征 ---")
+            self.sample_entropy(epoch_sec=epoch_sec)
+            self.permutation_entropy(epoch_sec=epoch_sec)
+            self.approximate_entropy(epoch_sec=epoch_sec)
+
+        # ---- 复杂度 & 分形 ----
+        if 'complexity' in groups:
+            print("\n--- 复杂度 & 分形 ---")
+            self.lempel_ziv_complexity(epoch_sec=epoch_sec)
+            self.higuchi_fractal_dimension(epoch_sec=epoch_sec)
+            self.dfa(epoch_sec=epoch_sec)
+            self.catch22_features(epoch_sec=epoch_sec)
+            self.wavelet_features(epoch_sec=epoch_sec)
+
+        # ---- hctsa 风格: tsfresh 大规模特征 ----
+        if 'tsfresh' in groups:
+            print("\n--- tsfresh 大规模特征 (hctsa 风格) ---")
+            try:
+                self.tsfresh_features(epoch_sec=epoch_sec)
+            except Exception as e:
+                print(f"tsfresh 跳过: {e}")
+
+        # ---- RQA 递归定量分析 ----
+        if 'rqa' in groups:
+            print("\n--- 递归定量分析 (RQA) ---")
+            try:
+                self.rqa_features(epoch_sec=epoch_sec)
+            except Exception as e:
+                print(f"RQA 跳过: {e}")
+
+        # ---- 进阶频谱 ----
+        if 'adv_spectral' in groups:
+            print("\n--- 进阶频谱特征 ---")
+            try:
+                self.additional_spectral_features(epoch_sec=epoch_sec)
+            except Exception as e:
+                print(f"进阶频谱跳过: {e}")
+
+        # ---- 自相关 ----
+        if 'autocorrelation' in groups:
+            print("\n--- 自相关特征 ---")
+            try:
+                self.autocorrelation_features(epoch_sec=epoch_sec)
+            except Exception as e:
+                print(f"自相关跳过: {e}")
+
+        # ---- 特征波 ----
+        if not skip_sssm:
+            print("\n--- 特征波检测 ---")
+            try:
+                self.feature_waves()
+            except Exception as e:
+                print(f"SSSM 特征波检测跳过: {e}")
+
+        # ---- 多通道: 连接性 ----
+        if 'connectivity' in groups and self._load_all:
+            print("\n--- 功能连接 ---")
+            self.functional_connectivity(epoch_sec=epoch_sec)
+
+        # ---- 多通道: 微状态 ----
+        if 'microstates' in groups and self._load_all:
+            print("\n--- 微状态分析 ---")
+            self.microstate_analysis()
+
+        # ---- 多通道: 空间 ----
+        if 'spatial' in groups and self._load_all:
+            print("\n--- 空间特征 ---")
+            self.global_field_power(epoch_sec=epoch_sec)
+            self.spatial_complexity(epoch_sec=epoch_sec)
+
+        # ---- 图论 ----
+        if 'spatial' in groups and self._load_all:
+            print("\n--- 图论指标 ---")
+            self.graph_metrics(epoch_sec=epoch_sec)
+
+        # ---- 源定位: fsaverage模板 + eLORETA/dSPM/MNE 逆解 ---- 
+        if not skip_source_loc and self._load_all:
+            print(f"\n--- 源定位 ({source_method}) ---")
+            self.source_localization(method=source_method,
+                                     epoch_sec=epoch_sec)
+
+        print(f"\n{'='*60}")
+        print("全部特征提取完成！")
+        self.summary()
+        return self.features
+
+    def summary(self):
+        """打印已提取特征的摘要。"""
+        print(f"\n--- 特征摘要 ---")
+        if not self.features:
+            print("  (无特征)")
+            return
+        for key, val in self.features.items():
+            if key == 'recording_date':
+                print(f"  {key}: {val.get('date', 'N/A')}")
+            elif isinstance(val, np.ndarray):
+                print(f"  {key}: shape={val.shape}")
+            elif isinstance(val, dict):
+                if 'values' in val:
+                    v = val['values']
+                    if isinstance(v, np.ndarray):
+                        print(f"  {key}: shape={v.shape}")
+                    elif isinstance(v, dict):
+                        shapes = {k: arr.shape for k, arr in v.items()
+                                  if isinstance(arr, np.ndarray)}
+                        print(f"  {key}: {shapes}")
+                    else:
+                        print(f"  {key}: {type(v).__name__}")
+                elif 'records' in val:
+                    print(f"  {key}: {len(val['records'])} records")
+                elif 'labels' in val:
+                    print(f"  {key}: {val['n_states']} microstates, {len(val['labels'])} labels")
+                else:
+                    print(f"  {key}: {list(val.keys())}")
+            else:
+                print(f"  {key}: {type(val).__name__}")
+
+    def to_dataframe(self, epoch_sec: float = 30) -> pd.DataFrame:
+        """
+        将所有 epoch 对齐的特征导出为 DataFrame。
+
+        处理以下几类特征存储格式:
+        - {'values': ndarray} → 直接展开
+        - {'values': dict of ndarray} → subkey 展开
+        - {'records': [...], 'slope_per_epoch': ndarray, ...} → aperiodic 特殊处理
+        - ndarray (直接存储) → feature_waves 等
+        - {'values': {'psd_features': ndarray, ...}} → PSD 频带
+
+        Returns:
+            pd.DataFrame, 每行一个 epoch
+        """
+        n_epochs = self._get_n_epochs(epoch_sec)
+        rows = []
+        for ep in range(n_epochs):
+            row = {'epoch': ep}
+            for name, val in self.features.items():
+                # ---- 格式1: {'values': ndarray} ----
+                if isinstance(val, dict) and 'values' in val:
+                    v = val['values']
+                    if isinstance(v, np.ndarray):
+                        if v.ndim == 1 and len(v) == n_epochs:
+                            row[name] = v[ep]
+                        elif v.ndim == 2 and v.shape[0] == n_epochs:
+                            # 每个 epoch 一行, 取均值或分列
+                            if v.shape[1] <= 30:
+                                for j in range(v.shape[1]):
+                                    row[f'{name}_{j}'] = v[ep, j]
+                            else:
+                                row[f'{name}_mean'] = np.nanmean(v[ep])
+                        elif v.ndim == 3 and v.shape[0] == n_epochs:
+                            # 连接矩阵等: 取平均连接强度
+                            row[f'{name}_mean'] = np.nanmean(v[ep])
+                    elif isinstance(v, dict):
+                        # {'values': {subk: ndarray, ...}}
+                        for subk, subv in v.items():
+                            if isinstance(subv, np.ndarray) and len(subv) == n_epochs:
+                                row[f'{name}_{subk}'] = subv[ep]
+
+                # ---- 格式2: {'records': [...], 'slope_per_epoch': ndarray, ...} ----
+                elif isinstance(val, dict) and 'slope_per_epoch' in val:
+                    row['aperiodic_slope'] = val['slope_per_epoch'][ep]
+                    if 'beta_per_epoch' in val:
+                        row['aperiodic_beta'] = val['beta_per_epoch'][ep]
+
+                # ---- 格式3: ndarray (直接存储) ----
+                elif isinstance(val, np.ndarray):
+                    if val.ndim == 1 and len(val) == n_epochs:
+                        row[name] = val[ep]
+                    elif val.ndim == 2 and val.shape[0] == n_epochs:
+                        row[f'{name}_mean'] = np.nanmean(val[ep])
+
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    def save_features(self, output_path):
+        """
+        保存提取的特征到 pickle 文件。
+
+        Args:
+            output_path: 输出文件路径
+        """
+        try:
+            import pickle
+            # 过滤掉大型数据（raw 对象等），只保存特征
+            save_data = {
+                'file_path': self.file_path,
+                'eeg_channel': self.eeg_channel,
+                'sfreq': self.sfreq,
+                'n_channels': self.n_channels,
+                'features': self.features,
+            }
+            with open(output_path, 'wb') as f:
+                pickle.dump(save_data, f)
+            print(f"特征已保存到: {output_path}")
+        except Exception as e:
+            print(f"保存特征失败: {e}")

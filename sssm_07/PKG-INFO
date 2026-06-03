@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: sssm
+Version: 0.0.7
+Requires-Dist: requests
+Requires-Dist: importlib-metadata
+Requires-Dist: torch
+Requires-Dist: pandas
+Requires-Dist: einops
+Requires-Dist: seaborn
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: matplotlib
+Dynamic: requires-dist

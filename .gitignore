@@ -1,0 +1,41 @@
+# EEG data (.mff raw files — too large for git)
+*.mff/
+*.mff.zip
+
+# Generated outputs
+*.pkl
+*.csv
+*.npy
+*.npz
+batch_log.txt
+_batch_log.txt
+pipeline_log.txt
+allinone_log.txt
+pipeline_results.pkl
+batch_results.pkl
+temp_results.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data directories
+data/
+output/
+results/
+
+# OS
+.DS_Store
+Thumbs.db
