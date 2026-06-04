@@ -2347,7 +2347,7 @@ class SleepEEGFeatureExtractor:
 
         # 约束为固定朝向（皮层锥体细胞垂直于皮层表面）
         fwd = mne.convert_forward_solution(
-            fwd, surf_ori=True, force_fixed=True, copy=False)
+            fwd, surf_ori=True, force_fixed=False, copy=False)
 
         # ── Step 4: 数据准备 + 噪声协方差 ──
         print("[Source Loc] Step 4/5: 准备 epoch 数据 + 噪声协方差...")
@@ -2859,13 +2859,14 @@ class SleepEEGFeatureExtractor:
             subjects_dir=subjects_dir, add_dist=False)
         print(f"[Step4] 源空间: ~{sum(len(s['vertno']) for s in src)} 顶点")
 
-        # ── Step 2: BEM (一次性) ──
-        print("[Step4] 构建 BEM 模型...")
-        conductivity = (0.3,)
+        # ── Step 2: BEM (一次性, 三层: 头皮/颅骨/脑) ──
+        print("[Step4] 构建 BEM 模型 (三层: scalp/skull/brain)...")
+        conductivity = (0.3, 0.006, 0.3)  # scalp, skull, brain
         model_bem = mne.make_bem_model(
             'fsaverage', ico=4, conductivity=conductivity,
             subjects_dir=subjects_dir)
         bem = mne.make_bem_solution(model_bem)
+        print("[Step4] BEM 模型完成")
 
         # ── Step 3: 蒙太奇 + 前向解 (一次性) ──
         print("[Step4] 设置电极蒙太奇 + 前向解...")
@@ -2881,12 +2882,13 @@ class SleepEEGFeatureExtractor:
             info_fwd, trans=trans, src=src, bem=bem,
             meg=False, eeg=True, mindist=5.0, n_jobs=1)
         fwd = mne.convert_forward_solution(
-            fwd, surf_ori=True, force_fixed=True, copy=False)
+            fwd, surf_ori=True, force_fixed=False, copy=False)
         print(f"[Step4] 前向解: {fwd['nsource']} 源, {fwd['nchan']} 通道")
 
-        # ── 逐切片处理 ──
+        # ── 逐切片处理（累积 ROI 时间序列）──
         epoch_samples = int(epoch_sec * sfreq)
-        all_stc_epochs = []
+        roi_ts_epochs = []  # list of (n_rois, n_times_per_epoch)
+        roi_names_list = None
 
         for sl in range(n_slices):
             start_samp = sl * slice_samples
@@ -2938,63 +2940,99 @@ class SleepEEGFeatureExtractor:
             epochs = mne.EpochsArray(
                 data_3d, info_fwd, events=events, tmin=0,
                 baseline=None, verbose=False)
+            epochs.set_eeg_reference('average', projection=True)
+            epochs.apply_proj()
             del filted_slice, data_3d; gc.collect()
 
             # 噪声协方差（用本切片数据估计）
             noise_cov = mne.compute_covariance(
                 epochs, method='shrunk', verbose=False)
 
-            # 逆算子
+            # 逆算子 (force_fixed=True 的前向解必须用 fixed=True)
             inv_op = make_inverse_operator(
                 epochs.info, fwd, noise_cov,
-                loose=0.2, depth=0.8, verbose=False)
+                fixed=True, depth=0.8, verbose=False)
 
-            # 逆解每个 epoch
+            # 逆解每个 epoch（仅提取 ROI 时间序列）
             for ep in range(n_epochs_slice):
                 evoked = epochs[ep].average()
                 stc = apply_inverse(
                     evoked, inv_op, method=method,
                     pick_ori=None, verbose=False)
-                all_stc_epochs.append(stc)
+
+                # 首切片: 读取皮层 ROI 标签 (Desikan-Killiany 69 labels)
+                if roi_names_list is None:
+                    labels = mne.read_labels_from_annot(
+                        'fsaverage', parc='aparc',
+                        subjects_dir=subjects_dir)
+                    roi_names_list = [l.name for l in labels]
+
+                # 提取 ROI 时间序列 (69, n_times)
+                label_ts = mne.extract_label_time_course(
+                    stc, labels, src, mode='mean',
+                    allow_empty=True, verbose=False)
+                roi_ts_epochs.append(label_ts)
+
+                del stc
 
             del epochs, noise_cov, inv_op
             gc.collect()
-            print(f"[Step4]   逆解完成: {n_epochs_slice} epochs → "
-                  f"累计 {len(all_stc_epochs)} 个")
+            print(f"[Step4]   逆解完成: {n_epochs_slice} epochs")
 
-        # ── 汇总结果 ──
-        if not all_stc_epochs:
+        # ── 汇总: 从 ROI 时间序列计算频带功率 ──
+        n_epochs_total = len(roi_ts_epochs)
+        if n_epochs_total == 0 or roi_names_list is None:
             print("[Step4] ✗ 无有效源定位结果")
             self._clear_cache('source')
             return
 
-        print(f"\n[Step4] 源定位汇总: {len(all_stc_epochs)} epochs × "
-              f"{all_stc_epochs[0].data.shape[0]} 源")
+        print(f"\n[Step4] 源定位汇总: {n_epochs_total} epochs × "
+              f"{len(roi_names_list)} ROIs")
 
-        src_result = {
-            'stc_epochs': all_stc_epochs,
-            'method': method,
-            'src': src,
-            'fwd': fwd,
-            'n_epochs': len(all_stc_epochs),
+        # 计算每个 ROI 每 epoch 的频带功率
+        roi_band_power = {}
+        for band_name, (fl, fh) in self.FREQ_BANDS.items():
+            roi_band_power[band_name] = np.zeros(
+                (n_epochs_total, len(roi_names_list)))
+
+        for ep in range(n_epochs_total):
+            ts = roi_ts_epochs[ep]  # (n_rois, n_times)
+            for band_name, (fl, fh) in self.FREQ_BANDS.items():
+                # Welch PSD per ROI (69 ROIs, fast)
+                freqs, psd = scipy.signal.welch(
+                    ts, fs=int(epoch_samples / epoch_sec),
+                    nperseg=min(256, ts.shape[1]))
+                bm = (freqs >= fl) & (freqs <= fh)
+                bp = np.trapz(psd[:, bm], freqs[bm], axis=1)
+                roi_band_power[band_name][ep] = bp
+
+        self.features['source_band_power'] = {
+            'values': roi_band_power,
+            'meta': {'epoch_sec': epoch_sec, 'method': method,
+                     'bands': dict(self.FREQ_BANDS),
+                     'roi_names': roi_names_list}
         }
-        self.features['source_localization'] = {'values': src_result}
+        print(f"[Step4] 源空间频带功率: {n_epochs_total} epochs × "
+              f"{len(self.FREQ_BANDS)} bands × {len(roi_names_list)} ROIs")
 
-        # ── 源空间频带功率 ──
-        print("\n[Step4] 源空间频带功率...")
-        try:
-            self.source_band_power(epoch_sec=epoch_sec, method=method)
-        except Exception as e:
-            print(f"[Step4] 频带功率失败: {e}")
+        # ROI RMS 功率
+        roi_rms = np.zeros((n_epochs_total, len(roi_names_list)))
+        for ep in range(n_epochs_total):
+            ts = roi_ts_epochs[ep]
+            roi_rms[ep] = np.sqrt(np.mean(ts ** 2, axis=1))
 
-        # ── 源空间 ROI 功率 ──
-        print("\n[Step4] 源空间 ROI 功率 (Desikan-Killiany)...")
-        try:
-            self.source_roi_power(epoch_sec=epoch_sec, method=method,
-                                  parc='aparc')
-        except Exception as e:
-            print(f"[Step4] ROI 功率失败: {e}")
+        roi_power_dict = {roi_names_list[i]: roi_rms[:, i]
+                          for i in range(len(roi_names_list))}
+        n_valid = sum(1 for v in roi_power_dict.values()
+                      if not np.all(np.isnan(v)))
+        self.features['source_roi_power'] = {
+            'values': roi_power_dict,
+            'meta': {'epoch_sec': epoch_sec, 'method': method,
+                     'parc': 'aparc', 'n_rois': len(roi_names_list)}
+        }
+        print(f"[Step4] 源空间 ROI 功率: {n_valid}/{len(roi_names_list)} ROIs 非空")
 
+        del roi_ts_epochs
         self._clear_cache('source')
         print(f"[Step 4/4] ✓ 源定位完成 (缓存已清除)")
 
