@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-extract_single_night.py — 单夜特征提取子进程
-=============================================
-被 run_pipeline.py 以 subprocess 调用，独立运行一个夜晚的特征提取。
-避免 importlib 内联加载时的阻塞问题。
+extract_single_night.py — 单夜全特征提取子进程
+================================================
+被 run_pipeline.py 以 subprocess 调用，独立运行一个夜晚的完整特征提取。
+
+4步线性流水线：
+  Step 1: 单通道特征 (E21≈Cz) — 频谱/时域/熵/复杂度/tsfresh/RQA
+  Step 2: YASA 睡眠分期 (EEG+EOG) — 加载 EOG 通道，分期后清除
+  Step 3: 多通道 ROI 特征 — 半球分区 (≤5通道/侧)，提取后清除
+  Step 4: 源定位 (eLORETA) — 时间切片全通道加载，提取后清除
 
 用法:
   python extract_single_night.py --mff I:/101Night/Nathalie-40_...mff --night 40
+  python extract_single_night.py --mff ... --night 40 --skip-source  # 跳过源定位
+  python extract_single_night.py --mff ... --night 40 --skip-yasa   # 跳过 YASA
 """
 
 import sys
@@ -15,68 +22,95 @@ import time
 import argparse
 from pathlib import Path
 
-# ── 路径 ──
+# ── 项目路径 ──
 PROJECT_DIR = Path(__file__).resolve().parent
-
-# 轻量特征组 (无需多通道、SSSM、tsfresh)
-LIGHT_GROUPS = ('basic', 'time_domain', 'frequency', 'entropy', 'complexity')
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='单夜全特征提取 (4步流水线)')
     parser.add_argument('--mff', required=True, help='.mff 目录路径')
     parser.add_argument('--night', type=int, required=True)
-    parser.add_argument('--output', default=None, help='输出目录 (默认: 当前目录)')
+    parser.add_argument('--output', default=None,
+                        help='输出目录 (默认: 当前目录)')
+    parser.add_argument('--eeg-channel', default='E21',
+                        help='主EEG通道 (默认: E21≈Cz)')
+    parser.add_argument('--eog-channels', nargs=2, default=['E67', 'E219'],
+                        help='EOG通道对 (默认: E67 E219)')
+    parser.add_argument('--epoch-sec', type=float, default=30,
+                        help='Epoch长度/秒 (默认: 30)')
+    parser.add_argument('--max-per-hemi', type=int, default=5,
+                        help='Step3每半球最多通道 (默认: 5)')
+    parser.add_argument('--skip-yasa', action='store_true',
+                        help='跳过 Step 2 (YASA 睡眠分期)')
+    parser.add_argument('--skip-source', action='store_true',
+                        help='跳过 Step 4 (源定位)')
+    parser.add_argument('--skip-sssm', action='store_true',
+                        help='跳过 SSSM 特征波检测')
+    parser.add_argument('--source-method', default='eLORETA',
+                        choices=['eLORETA', 'dSPM', 'MNE'],
+                        help='源定位逆解方法 (默认: eLORETA)')
+    parser.add_argument('--slice-sec', type=float, default=600,
+                        help='源定位时间切片长度/秒 (默认: 600)')
     args = parser.parse_args()
 
     out_dir = Path(args.output) if args.output else PROJECT_DIR
     night = args.night
     mff_path = args.mff
 
-    print(f"[{night}] 开始特征提取: {mff_path}")
+    print(f"\n{'#'*60}")
+    print(f"# Night {night} — 4步全特征提取")
+    print(f"# 文件: {mff_path}")
+    print(f"# 主通道: {args.eeg_channel}")
+    print(f"# EOG: {args.eog_channels}")
+    print(f"# Epoch: {args.epoch_sec}s")
+    print(f"# 跳过YASA: {args.skip_yasa}, 跳过源定位: {args.skip_source}")
+    print(f"{'#'*60}\n")
     t0 = time.time()
 
     try:
-        # 导入 SleepEEGFeatureExtractor (importlib, 数字文件名)
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "analy", str(PROJECT_DIR / "101night_analy.py"))
-        analy = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(analy)
+        # ── 导入 SleepEEGFeatureExtractor ──
+        import feature_101night_analy as analy
         SleepEEGFeatureExtractor = analy.SleepEEGFeatureExtractor
-
         print(f"[{night}] 模块加载完成 ({time.time()-t0:.0f}s)")
 
-        # 初始化 — 仅单通道，不加载多通道
+        # ── 初始化 — 单通道 MNE 加载 (~60 MB) ──
         ext = SleepEEGFeatureExtractor(
-            mff_path, eeg_channel='E21',
-            load_all_channels=False,
+            mff_path,
+            eeg_channel=args.eeg_channel,
+            load_all_channels=True,  # 允许多通道特征（惰性加载）
         )
-        print(f"[{night}] 初始化: {ext.n_channels}ch, {ext.sfreq:.0f}Hz, "
+        print(f"[{night}] 初始化: {ext.n_channels}通道, {ext.sfreq}Hz, "
               f"{ext.n_times/ext.sfreq/3600:.1f}h ({time.time()-t0:.0f}s)")
 
-        # 运行轻量特征组
+        # ── 运行 4 步流水线 ──
         ext.run_all(
-            epoch_sec=30,
-            groups=LIGHT_GROUPS,
-            skip_yasa=True,
-            skip_sssm=True,
+            epoch_sec=args.epoch_sec,
+            groups=('basic', 'time_domain', 'frequency', 'entropy',
+                    'complexity', 'connectivity', 'microstates', 'spatial',
+                    'tsfresh', 'rqa', 'adv_spectral', 'autocorrelation'),
+            skip_yasa=args.skip_yasa,
+            skip_sssm=args.skip_sssm,
+            skip_source_loc=args.skip_source,
+            source_method=args.source_method,
+            yasa_eog_channels=tuple(args.eog_channels),
+            max_per_hemi=args.max_per_hemi,
         )
-        print(f"[{night}] run_all 完成 ({time.time()-t0:.0f}s)")
 
-        # 保存 CSV
-        df = ext.to_dataframe(epoch_sec=30)
+        # ── 保存 CSV ──
+        df = ext.to_dataframe(epoch_sec=args.epoch_sec)
         csv_path = out_dir / f"features_night{night}_pipeline.csv"
         df.to_csv(csv_path, index=False)
-        print(f"[{night}] CSV 保存: {csv_path} ({len(df)} epochs, {len(df.columns)} cols)")
+        print(f"[{night}] CSV 保存: {csv_path} "
+              f"({len(df)} epochs, {len(df.columns)} cols)")
 
-        # 保存 pickle
+        # ── 保存 Pickle ──
         pkl_path = out_dir / f"features_night{night}_pipeline.pkl"
         ext.save_features(str(pkl_path))
         print(f"[{night}] PICKLE 保存: {pkl_path}")
 
         elapsed = time.time() - t0
-        print(f"[{night}] ✓ 完成 ({elapsed:.0f}s)")
+        print(f"\n[{night}] ✓ 完成 ({elapsed/60:.1f} 分钟)")
         return 0
 
     except Exception as e:
@@ -84,6 +118,8 @@ def main():
         import traceback
         traceback.print_exc()
         return 1
+    finally:
+        gc.collect()
 
 
 if __name__ == '__main__':
