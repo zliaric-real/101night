@@ -272,13 +272,13 @@ def process_one_night(rec):
                     eogR_chunks.append(chunk_2d[:, eogR_idx].copy())
 
         # 拼接 + 转换
-        eeg = np.concatenate(eeg_chunks).astype("float64") * 1e6
+        eeg = np.concatenate(eeg_chunks).astype("float64")  # signal1.bin 已是 μV
         del eeg_chunks
         eeg_mb = eeg.nbytes / 1e6
 
         if have_eog:
-            eogL = np.concatenate(eogL_chunks).astype("float64") * 1e6
-            eogR = np.concatenate(eogR_chunks).astype("float64") * 1e6
+            eogL = np.concatenate(eogL_chunks).astype("float64")  # signal1.bin 已是 μV
+            eogR = np.concatenate(eogR_chunks).astype("float64")  # signal1.bin 已是 μV
             eog = eogL - eogR
             del eogL, eogR, eogL_chunks, eogR_chunks
             log(f"  N{night}: data loaded — EEG {eeg_mb:.0f}MB, EOG bipolar ({time.time()-t_read:.0f}s)")

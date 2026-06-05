@@ -153,7 +153,7 @@ def _load_channel_data(mff_path_str, n_channels, channel_indices,
         filter_params: optional (low, high) bandpass
 
     Returns:
-        dict mapping channel_name -> 1D float64 array (uV)
+        dict mapping channel_idx -> 1D float64 array (μV, NA400 stores μV natively)
     """
     from pathlib import Path
     import gc
@@ -187,7 +187,7 @@ def _load_channel_data(mff_path_str, n_channels, channel_indices,
 
     result = {}
     for idx in channel_indices:
-        data = np.concatenate(channel_chunks[idx]).astype("float64") * 1e6
+        data = np.concatenate(channel_chunks[idx]).astype("float64")  # signal1.bin 已是 μV
         result[idx] = data
 
     gc.collect()
@@ -265,7 +265,7 @@ def _load_channel_data_slice(mff_path_str, n_channels, channel_indices,
     for idx in channel_indices:
         chunks = channel_chunks[idx]
         if chunks:
-            data = np.concatenate(chunks).astype("float64") * 1e6
+            data = np.concatenate(chunks).astype("float64")  # signal1.bin 已是 μV
             result[idx] = data
 
     del channel_chunks; gc.collect()
@@ -2664,11 +2664,11 @@ class SleepEEGFeatureExtractor:
             self.file_path, self.n_channels,
             [eeg_idx, eogL_idx, eogR_idx])
         print(f"[Step2] 加载完成 ({time.time()-t_load:.1f}s) — "
-              f"三个通道来源一致, 天然对齐")
+              f"三通道来源一致, 天然对齐")
 
         # ── 构建 EEG + 双极 EOG ──
-        eeg_data = ch_data[eeg_idx]                    # E21, μV
-        eog_bipolar = ch_data[eogL_idx] - ch_data[eogR_idx]  # E67-E219, μV
+        eeg_data = ch_data[eeg_idx]                            # E21, μV
+        eog_bipolar = ch_data[eogL_idx] - ch_data[eogR_idx]    # E67-E219, μV
 
         # 来源统一，无需对齐 — 直接 stacking
         combined = np.vstack([eeg_data, eog_bipolar])
