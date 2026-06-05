@@ -2683,9 +2683,8 @@ class SleepEEGFeatureExtractor:
             ch_types=['eeg', 'eog'])
         raw_stage = mne.io.RawArray(combined, info, verbose=False)
 
-        # ── 运行 YASA ──
-        print(f"[Step2] YASA SleepStaging 开始... "
-              f"(首次运行需下载模型 ~100MB, 10-15min)")
+        # ── 运行 YASA (LightGBM 模型已内置，秒级加载) ──
+        print(f"[Step2] YASA SleepStaging 开始... ")
         t_yasa = time.time()
         try:
             sls = yasa.SleepStaging(
