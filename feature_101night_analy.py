@@ -2619,13 +2619,14 @@ class SleepEEGFeatureExtractor:
     def run_step2_yasa_with_eog(self,
                                  eog_channels=('E67', 'E219'),
                                  metadata=None):
-        """Step 2: YASA 睡眠分期 — EEG+EOG 双通道。
+        """Step 2: YASA 睡眠分期 — EEG+EOG 统一从 signal1.bin 加载。
 
-        从 signal1.bin 临时加载 EOG 通道（E67/E219），构建双极导联
-        EOG = E67 - E219，与 E21 组成 EEG+EOG 双通道 RawArray 送 YASA。
+        一次通读 signal1.bin 同时提取 E21 + E67 + E219 三个通道，
+        避免 MNE (EEG) 和 chunked parser (EOG) 来源不一致导致的对齐问题。
+        所有通道来自同一个 parser → 长度天然一致。
 
         EOG 增强显著提高 Wake vs REM 判别准确率（~70-80% vs ~60-70%）。
-        YASA 完成后立即清除 EOG 数据释放 ~120 MB。
+        YASA 完成后立即清除数据释放 ~180 MB。
 
         Args:
             eog_channels: (left, right) EOG 通道对，
@@ -2636,7 +2637,7 @@ class SleepEEGFeatureExtractor:
         import time
 
         print(f"\n{'='*60}")
-        print(f"[Step 2/4] YASA 睡眠分期 (EEG+EOG)")
+        print(f"[Step 2/4] YASA 睡眠分期 (EEG+EOG, 统一chunked加载)")
         print(f"{'='*60}\n")
 
         eog_left, eog_right = eog_channels
@@ -2645,37 +2646,31 @@ class SleepEEGFeatureExtractor:
         for ch in [eog_left, eog_right]:
             if ch not in self.ch_names:
                 print(f"[Step2] ✗ EOG 通道 {ch} 不存在！仅用 EEG 做分期")
-                # 回退：仅 EEG
                 self.sleep_stages_yasa(
                     eog_channels=eog_channels,
                     create_bipolar_eog=False,
                     metadata=metadata)
                 return
 
-        # ── 从磁盘加载 EOG 通道 (chunked frombuffer) ──
+        # ── 一次通读 signal1.bin 加载 E21 + E67 + E219 ──
+        eeg_idx = self._eeg_idx
         eogL_idx = self.ch_names.index(eog_left)
         eogR_idx = self.ch_names.index(eog_right)
 
-        print(f"[Step2] 加载 EOG 通道: {eog_left}(idx={eogL_idx}), "
-              f"{eog_right}(idx={eogR_idx})")
+        print(f"[Step2] 统一加载: {self.eeg_channel}(idx={eeg_idx}), "
+              f"{eog_left}(idx={eogL_idx}), {eog_right}(idx={eogR_idx})")
         t_load = time.time()
-        eog_data = _load_channel_data(
+        ch_data = _load_channel_data(
             self.file_path, self.n_channels,
-            [eogL_idx, eogR_idx])
-        print(f"[Step2] EOG 加载完成 ({time.time()-t_load:.1f}s)")
+            [eeg_idx, eogL_idx, eogR_idx])
+        print(f"[Step2] 加载完成 ({time.time()-t_load:.1f}s) — "
+              f"三个通道来源一致, 天然对齐")
 
-        # ── 双极 EOG + EEG → RawArray ──
-        eog_bipolar = eog_data[eogL_idx] - eog_data[eogR_idx]
-        eeg_data = self.data  # 已在 __init__ 中加载 (μV)
+        # ── 构建 EEG + 双极 EOG ──
+        eeg_data = ch_data[eeg_idx]                    # E21, μV
+        eog_bipolar = ch_data[eogL_idx] - ch_data[eogR_idx]  # E67-E219, μV
 
-        # 对齐长度 (MNE 和 chunked parser 可能因 EOF 处理差异而不同)
-        min_len = min(len(eeg_data), len(eog_bipolar))
-        if len(eeg_data) != len(eog_bipolar):
-            print(f"[Step2] 长度对齐: EEG={len(eeg_data)}, EOG={len(eog_bipolar)} "
-                  f"→ {min_len} (差 {abs(len(eeg_data)-len(eog_bipolar))})")
-            eeg_data = eeg_data[:min_len]
-            eog_bipolar = eog_bipolar[:min_len]
-
+        # 来源统一，无需对齐 — 直接 stacking
         combined = np.vstack([eeg_data, eog_bipolar])
         info = mne.create_info(
             [self.eeg_channel, 'EOG'],
@@ -2715,14 +2710,15 @@ class SleepEEGFeatureExtractor:
             print(f"[Step2] YASA 完成 ({time.time()-t_yasa:.0f}s): "
                   f"{stage_pct}")
 
-            del sls  # CRITICAL: delete AFTER np.asarray copy (see skill docs)
+            del sls
         except Exception as e:
             print(f"[Step2] YASA 失败: {e}")
 
-        # ── 清除 EOG 缓存 ──
-        del eog_data, eog_bipolar, combined, raw_stage
+        # ── 清除数据 ──
+        del ch_data, eeg_data, eog_bipolar, combined, raw_stage
         self._clear_cache('eog')
-        print(f"[Step 2/4] ✓ YASA 分期完成 (EOG 缓存已清除)")
+        gc.collect()
+        print(f"[Step 2/4] ✓ YASA 分期完成 (数据已清除)")
 
     def run_step3_multichannel_roi(self, epoch_sec=30,
                                     max_per_hemi=5,
