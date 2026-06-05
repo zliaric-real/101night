@@ -2845,3 +2845,154 @@ Average reference projection was added, but has not been applied yet. Use the ap
 Created an SSP operator (subspace dimension = 1)
 1 projection items activated
 SSP projectors applied...
+[Step4]   逆解完成: 19 epochs
+
+[Step4] 切片 17/20: 样本 2400000-2550000 (600s)
+[Step4]   加载: (256, 149994), 307 MB (0.3s)
+Filtering raw data in 1 contiguous segment
+Setting up band-pass filter from 0.1 - 40 Hz
+
+FIR filter parameters
+---------------------
+Designing a one-pass, zero-phase, non-causal bandpass filter:
+- Windowed time-domain design (firwin) method
+- Hamming window with 0.0194 passband ripple and 53 dB stopband attenuation
+- Lower passband edge: 0.10
+- Lower transition bandwidth: 0.10 Hz (-6 dB cutoff frequency: 0.05 Hz)
+- Upper passband edge: 40.00 Hz
+- Upper transition bandwidth: 10.00 Hz (-6 dB cutoff frequency: 45.00 Hz)
+- Filter length: 8251 samples (33.004 s)
+
+[Step4]   滤波 (0.7s)
+EEG channel type selected for re-referencing
+Adding average EEG reference projection.
+1 projection items deactivated
+Average reference projection was added, but has not been applied yet. Use the apply_proj method to apply it.
+Created an SSP operator (subspace dimension = 1)
+1 projection items activated
+SSP projectors applied...
+[Step4]   逆解完成: 19 epochs
+
+[Step4] 切片 18/20: 样本 2550000-2700000 (600s)
+[Step4]   加载: (256, 149994), 307 MB (0.3s)
+Filtering raw data in 1 contiguous segment
+Setting up band-pass filter from 0.1 - 40 Hz
+
+FIR filter parameters
+---------------------
+Designing a one-pass, zero-phase, non-causal bandpass filter:
+- Windowed time-domain design (firwin) method
+- Hamming window with 0.0194 passband ripple and 53 dB stopband attenuation
+- Lower passband edge: 0.10
+- Lower transition bandwidth: 0.10 Hz (-6 dB cutoff frequency: 0.05 Hz)
+- Upper passband edge: 40.00 Hz
+- Upper transition bandwidth: 10.00 Hz (-6 dB cutoff frequency: 45.00 Hz)
+- Filter length: 8251 samples (33.004 s)
+
+[Step4]   滤波 (0.7s)
+EEG channel type selected for re-referencing
+Adding average EEG reference projection.
+1 projection items deactivated
+Average reference projection was added, but has not been applied yet. Use the apply_proj method to apply it.
+Created an SSP operator (subspace dimension = 1)
+1 projection items activated
+SSP projectors applied...
+[Step4]   逆解完成: 19 epochs
+
+[Step4] 切片 19/20: 样本 2700000-2850000 (600s)
+[Step4]   加载: (256, 149994), 307 MB (0.3s)
+Filtering raw data in 1 contiguous segment
+Setting up band-pass filter from 0.1 - 40 Hz
+
+FIR filter parameters
+---------------------
+Designing a one-pass, zero-phase, non-causal bandpass filter:
+- Windowed time-domain design (firwin) method
+- Hamming window with 0.0194 passband ripple and 53 dB stopband attenuation
+- Lower passband edge: 0.10
+- Lower transition bandwidth: 0.10 Hz (-6 dB cutoff frequency: 0.05 Hz)
+- Upper passband edge: 40.00 Hz
+- Upper transition bandwidth: 10.00 Hz (-6 dB cutoff frequency: 45.00 Hz)
+- Filter length: 8251 samples (33.004 s)
+
+[Step4]   滤波 (0.7s)
+EEG channel type selected for re-referencing
+Adding average EEG reference projection.
+1 projection items deactivated
+Average reference projection was added, but has not been applied yet. Use the apply_proj method to apply it.
+Created an SSP operator (subspace dimension = 1)
+1 projection items activated
+SSP projectors applied...
+[Step4]   逆解完成: 19 epochs
+
+[Step4] 切片 20/20: 样本 2850000-2988040 (552s)
+[Step4]   加载: (256, 103565), 212 MB (0.2s)
+Filtering raw data in 1 contiguous segment
+Setting up band-pass filter from 0.1 - 40 Hz
+
+FIR filter parameters
+---------------------
+Designing a one-pass, zero-phase, non-causal bandpass filter:
+- Windowed time-domain design (firwin) method
+- Hamming window with 0.0194 passband ripple and 53 dB stopband attenuation
+- Lower passband edge: 0.10
+- Lower transition bandwidth: 0.10 Hz (-6 dB cutoff frequency: 0.05 Hz)
+- Upper passband edge: 40.00 Hz
+- Upper transition bandwidth: 10.00 Hz (-6 dB cutoff frequency: 45.00 Hz)
+- Filter length: 8251 samples (33.004 s)
+
+[Step4]   滤波 (0.5s)
+EEG channel type selected for re-referencing
+Adding average EEG reference projection.
+1 projection items deactivated
+Average reference projection was added, but has not been applied yet. Use the apply_proj method to apply it.
+Created an SSP operator (subspace dimension = 1)
+1 projection items activated
+SSP projectors applied...
+[Step4]   逆解完成: 13 epochs
+
+[Step4] 源定位汇总: 374 epochs × 8196 源
+[Step4] 源空间频带功率: 374 epochs × 5 bands × 8196 sources
+[Step4] 源空间 ROI 功率: 69/69 ROIs 非空
+[Step 4/4] ✓ 源定位完成 (缓存已清除)
+  [内存] Step 4 源数据已清除, 单通道保留
+
+============================================================
+4步流水线完成! 总耗时: 70.4 分钟
+
+--- 特征摘要 ---
+  recording_date: 2017-10-11
+  psd: ['win_sec', 'n_windows', 'band_names', 'psd_features', 'shape']
+  spectral_entropy: shape=(398,)
+  aperiodic: 398 records
+  hjorth_mobility: shape=(398,)
+  hjorth_complexity: shape=(398,)
+  statistical: {'mean': (398,), 'variance': (398,), 'skewness': (398,), 'kurtosis': (398,), 'rms': (398,), 'line_length': (398,), 'zero_crossing_rate': (398,)}
+  sample_entropy: shape=(398,)
+  permutation_entropy: shape=(398,)
+  approximate_entropy: shape=(398,)
+  lz_complexity: shape=(398,)
+  higuchi_fd: shape=(398,)
+  dfa: shape=(398,)
+  catch22: shape=(398, 22)
+  wavelet: {'delta': (398,), 'theta': (398,), 'alpha': (398,), 'beta': (398,), 'gamma': (398,)}
+  tsfresh: shape=(398, 777)
+  rqa: {'RR': (398,), 'DET': (398,), 'LAM': (398,), 'L_max': (398,), 'L_mean': (398,), 'TT': (398,), 'ENTR': (398,)}
+  adv_spectral: {'centroid': (398,), 'spread': (398,), 'skewness': (398,), 'kurtosis': (398,), 'sef50': (398,), 'sef90': (398,), 'sef95': (398,), 'theta_beta_ratio': (398,), 'delta_alpha_ratio': (398,), 'alpha_beta_ratio': (398,)}
+  autocorrelation: {'acf_zc': (398,), 'acf_first_min': (398,), 'acf_decay': (398,), 'acf_lag1': (398,), 'acf_lag10': (398,)}
+  feature_waves: shape=(1, 3984)
+  connectivity: {'coherence': (393, 10, 10), 'plv': (393, 10, 10), 'correlation': (393, 10, 10)}
+  microstates: 4 microstates, 2953451 labels
+  gfp: shape=(398,)
+  omega_complexity: shape=(398,)
+  graph_metrics: {'mean_degree': (398,), 'mean_clustering': (398,), 'char_path_length': (398,)}
+  source_band_power: {'delta': (374, 8196), 'theta': (374, 8196), 'alpha': (374, 8196), 'beta': (374, 8196), 'gamma': (374, 8196)}
+  source_roi_power: {'bankssts-lh': (374,), 'bankssts-rh': (374,), 'caudalanteriorcingulate-lh': (374,), 'caudalanteriorcingulate-rh': (374,), 'caudalmiddlefrontal-lh': (374,), 'caudalmiddlefrontal-rh': (374,), 'cuneus-lh': (374,), 'cuneus-rh': (374,), 'entorhinal-lh': (374,), 'entorhinal-rh': (374,), 'frontalpole-lh': (374,), 'frontalpole-rh': (374,), 'fusiform-lh': (374,), 'fusiform-rh': (374,), 'inferiorparietal-lh': (374,), 'inferiorparietal-rh': (374,), 'inferiortemporal-lh': (374,), 'inferiortemporal-rh': (374,), 'insula-lh': (374,), 'insula-rh': (374,), 'isthmuscingulate-lh': (374,), 'isthmuscingulate-rh': (374,), 'lateraloccipital-lh': (374,), 'lateraloccipital-rh': (374,), 'lateralorbitofrontal-lh': (374,), 'lateralorbitofrontal-rh': (374,), 'lingual-lh': (374,), 'lingual-rh': (374,), 'medialorbitofrontal-lh': (374,), 'medialorbitofrontal-rh': (374,), 'middletemporal-lh': (374,), 'middletemporal-rh': (374,), 'paracentral-lh': (374,), 'paracentral-rh': (374,), 'parahippocampal-lh': (374,), 'parahippocampal-rh': (374,), 'parsopercularis-lh': (374,), 'parsopercularis-rh': (374,), 'parsorbitalis-lh': (374,), 'parsorbitalis-rh': (374,), 'parstriangularis-lh': (374,), 'parstriangularis-rh': (374,), 'pericalcarine-lh': (374,), 'pericalcarine-rh': (374,), 'postcentral-lh': (374,), 'postcentral-rh': (374,), 'posteriorcingulate-lh': (374,), 'posteriorcingulate-rh': (374,), 'precentral-lh': (374,), 'precentral-rh': (374,), 'precuneus-lh': (374,), 'precuneus-rh': (374,), 'rostralanteriorcingulate-lh': (374,), 'rostralanteriorcingulate-rh': (374,), 'rostralmiddlefrontal-lh': (374,), 'rostralmiddlefrontal-rh': (374,), 'superiorfrontal-lh': (374,), 'superiorfrontal-rh': (374,), 'superiorparietal-lh': (374,), 'superiorparietal-rh': (374,), 'superiortemporal-lh': (374,), 'superiortemporal-rh': (374,), 'supramarginal-lh': (374,), 'supramarginal-rh': (374,), 'temporalpole-lh': (374,), 'temporalpole-rh': (374,), 'transversetemporal-lh': (374,), 'transversetemporal-rh': (374,), 'unknown-lh': (374,)}
+[40] CSV 保存: E:\idea\101night\features_night40_pipeline.csv (398 epochs, 74 cols)
+特征已保存到: E:\idea\101night\features_night40_pipeline.pkl
+[40] PICKLE 保存: E:\idea\101night\features_night40_pipeline.pkl
+
+[40] ✓ 完成 (70.9 分钟)
+
+=== Exit code: 0 ===
+=== Night 40 Test End: Fri Jun  5 03:35:00 2026 ===

@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-extract_single_night.py — 单夜全特征提取子进程
-================================================
-被 run_pipeline.py 以 subprocess 调用，独立运行一个夜晚的完整特征提取。
+extract_single_night.py — 单夜特征提取子进程 (3步模式，不含源定位)
+==================================================================
+被 run_pipeline.py 以 subprocess 调用，独立运行一个夜晚的特征提取。
 
-4步线性流水线：
-  Step 1: 单通道特征 (E21≈Cz) — 频谱/时域/熵/复杂度/tsfresh/RQA
+3步线性流水线：
+  Step 1: 单通道特征 (E21≈Cz) — 频谱/时域/熵/复杂度/tsfresh/RQA/SSSM
   Step 2: YASA 睡眠分期 (EEG+EOG) — 加载 EOG 通道，分期后清除
   Step 3: 多通道 ROI 特征 — 半球分区 (≤5通道/侧)，提取后清除
-  Step 4: 源定位 (eLORETA) — 时间切片全通道加载，提取后清除
+  (Step 4 源定位已禁用 — 内存过大，暂不执行)
 
 用法:
   python extract_single_night.py --mff I:/101Night/Nathalie-40_...mff --night 40
-  python extract_single_night.py --mff ... --night 40 --skip-source  # 跳过源定位
   python extract_single_night.py --mff ... --night 40 --skip-yasa   # 跳过 YASA
 """
 
@@ -28,7 +27,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 
 def main():
     parser = argparse.ArgumentParser(
-        description='单夜全特征提取 (4步流水线)')
+        description='单夜特征提取 (3步流水线)')
     parser.add_argument('--mff', required=True, help='.mff 目录路径')
     parser.add_argument('--night', type=int, required=True)
     parser.add_argument('--output', default=None,
@@ -43,15 +42,8 @@ def main():
                         help='Step3每半球最多通道 (默认: 5)')
     parser.add_argument('--skip-yasa', action='store_true',
                         help='跳过 Step 2 (YASA 睡眠分期)')
-    parser.add_argument('--skip-source', action='store_true',
-                        help='跳过 Step 4 (源定位)')
     parser.add_argument('--skip-sssm', action='store_true',
                         help='跳过 SSSM 特征波检测')
-    parser.add_argument('--source-method', default='eLORETA',
-                        choices=['eLORETA', 'dSPM', 'MNE'],
-                        help='源定位逆解方法 (默认: eLORETA)')
-    parser.add_argument('--slice-sec', type=float, default=600,
-                        help='源定位时间切片长度/秒 (默认: 600)')
     args = parser.parse_args()
 
     out_dir = Path(args.output) if args.output else PROJECT_DIR
@@ -59,12 +51,12 @@ def main():
     mff_path = args.mff
 
     print(f"\n{'#'*60}")
-    print(f"# Night {night} — 4步全特征提取")
+    print(f"# Night {night} — 3步特征提取")
     print(f"# 文件: {mff_path}")
     print(f"# 主通道: {args.eeg_channel}")
     print(f"# EOG: {args.eog_channels}")
-    print(f"# Epoch: {args.epoch_sec}s")
-    print(f"# 跳过YASA: {args.skip_yasa}, 跳过源定位: {args.skip_source}")
+    print(f"# Epoch: {args.epoch_sec}s, 每半球≤{args.max_per_hemi}通道")
+    print(f"# 跳过YASA: {args.skip_yasa}, 跳过源定位: True (3步模式)")
     print(f"{'#'*60}\n")
     t0 = time.time()
 
@@ -83,7 +75,7 @@ def main():
         print(f"[{night}] 初始化: {ext.n_channels}通道, {ext.sfreq}Hz, "
               f"{ext.n_times/ext.sfreq/3600:.1f}h ({time.time()-t0:.0f}s)")
 
-        # ── 运行 4 步流水线 ──
+        # ── 运行 3 步流水线 (不含源定位) ──
         ext.run_all(
             epoch_sec=args.epoch_sec,
             groups=('basic', 'time_domain', 'frequency', 'entropy',
@@ -91,8 +83,7 @@ def main():
                     'tsfresh', 'rqa', 'adv_spectral', 'autocorrelation'),
             skip_yasa=args.skip_yasa,
             skip_sssm=args.skip_sssm,
-            skip_source_loc=args.skip_source,
-            source_method=args.source_method,
+            skip_source_loc=True,          # Step 4 永久禁用
             yasa_eog_channels=tuple(args.eog_channels),
             max_per_hemi=args.max_per_hemi,
         )
