@@ -58,14 +58,13 @@ class SleepEEGFeatureExtractor:
         ch_names: 通道名称列表
     """
     
-    def __init__(self, file_path, eeg_channel='E21', eog_channel='E61'):
+    def __init__(self, file_path, eeg_channel='E21'):
         """
         初始化特征提取器
         
         Args:
             file_path: .mff文件路径
             eeg_channel: 用于分析的主要EEG通道名称
-            eog_channel: 眼电通道名称 (传给YASA提升Wake/REM区分)
         """
         self.file_path = file_path
         
@@ -80,32 +79,19 @@ class SleepEEGFeatureExtractor:
         if eeg_channel not in raw.ch_names:
             print(f"警告: 通道 {eeg_channel} 不存在，使用第一个通道")
             eeg_channel = raw.ch_names[10]
-        if eog_channel is not None and eog_channel not in raw.ch_names:
-            print(f"警告: 眼电通道 {eog_channel} 不存在，不使用EOG")
-            eog_channel = None
-        
-        self.eeg_channel = eeg_channel
-        self.eog_channel = eog_channel
-        
-        # 构建 staging raw: EEG + EOG (双通道)，用于 YASA 睡眠分期
-        pick_list = [eeg_channel]
-        if eog_channel:
-            pick_list.append(eog_channel)
-        raw.pick(pick_list)
+    
+            
+        raw.pick([eeg_channel])
         raw.load_data()
+
         
-        self.raw_stage = raw.copy()  # 保留双通道给 YASA
-        
-        # 单通道 raw + data (用于特征提取)
-        self.raw = raw.copy().pick([eeg_channel])
+        # 获取指定通道的数据
+        self.raw = raw
+        self.eeg_channel = eeg_channel
         self.data = self.raw.get_data(units="uV")
         
         self.filted = self.raw.copy()
         self.filted = self.filted.filter(0.1, 40)
-        
-        print(f"[init] EEG={eeg_channel}, EOG={eog_channel}, "
-              f"channels={len(pick_list)}, sfreq={self.sfreq}Hz, "
-              f"duration={self.data.shape[-1]/self.sfreq/3600:.1f}h")
         
         # 存储提取的特征
         self.features = { }
@@ -122,15 +108,11 @@ class SleepEEGFeatureExtractor:
             睡眠分期数组（0: Wake, 1: N1, 2: N2, 3: N3, 4: REM）
         """
         try:
-            # 使用 raw_stage (EEG+EOG) 进行分期
-            kwargs = dict(eeg_name=self.eeg_channel)
-            if self.eog_channel:
-                kwargs['eog_name'] = self.eog_channel
-                print(f"[YASA] 使用 EEG={self.eeg_channel} + EOG={self.eog_channel}")
-            else:
-                print(f"[YASA] 使用 EEG={self.eeg_channel} (无EOG)")
-            
-            sls = yasa.SleepStaging(self.raw_stage, **kwargs)
+            # 使用yasa的睡眠分期功能
+            sls = yasa.SleepStaging(
+                self.raw, 
+                eeg_name=self.eeg_channel
+            )
             
             # 获取预测的睡眠分期
             hypno_pred = sls.predict()
@@ -146,8 +128,6 @@ class SleepEEGFeatureExtractor:
             
         except Exception as e:
             print(f"睡眠分期提取失败: {e}")
-            import traceback
-            traceback.print_exc()
             return None
     
     def recording_date(self):
@@ -596,9 +576,25 @@ class SleepEEGFeatureExtractor:
 
 extractor = SleepEEGFeatureExtractor(processed_files[0])
 
+【Reading EGI MFF Header from E:\idea\101night\Nathalie-40_20171011_121248.mff...
+    Reading events ...
+    Assembling measurement info ...
+    Excluding events {} ...
+Reading 0 ... 2988039  =      0.000 ... 11952.156 secs...
+Filtering raw data in 1 contiguous segment
+Setting up band-pass filter from 0.1 - 40 Hz
+
+FIR filter parameters
+---------------------
+Designing a one-pass, zero-phase, non-causal bandpass filter:
+- Windowed time-domain design (firwin) method
+- Hamming window with 0.0194 passband ripple and 53 dB stopband attenuation
+- Lower passband edge: 0.10
+- Lower transition bandwidth: 0.10 Hz (-6 dB cutoff frequency: 0.05 Hz)
+- Upper passband edge: 40.00 Hz
+- Upper transition bandwidth: 10.00 Hz (-6 dB cutoff frequency: 45.00 Hz)
+- Filter length: 8251 samples (33.004 s)
+】
+
 sls = extractor.sleep_stages_yasa()
-
-print(sls.hypno)
-
-
-
+【睡眠分期计算完成】
