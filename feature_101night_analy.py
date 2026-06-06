@@ -62,7 +62,7 @@ except ImportError:
 #  MFF I/O (extracted to eeg_io.py)
 # ═══════════════════════════════════════════════════════════
 from eeg_io import (_read_mff_metadata, _load_channel_data,
-                     _load_channel_data_slice)
+                     _load_channel_data_slice, detect_n_channels)
 
 
 def _label_anatomical_region(coords, indices):
@@ -2397,11 +2397,11 @@ class SleepEEGFeatureExtractor:
     def run_step2_yasa_with_eog(self,
                                  eog_channel='E67',
                                  metadata=None):
-        """Step 2: YASA 睡眠分期 — EEG + 单侧 EOG。
+        """Step 2: YASA 睡眠分期 — chunked frombuffer 加载 EEG+EOG。
 
-        E21 已在 __init__ 中加载为 self.data。EOG 单独通过 MNE
-        read_raw_egi(pick+load_data) 加载，只需 ~60 MB（仅 1 通道）。
-        两者来自相同 MNE parser → 长度一致 → 天然对齐。
+        EEG (E21) 已在 __init__ 中通过 MNE 加载为 self.data。
+        EOG 和用于 YASA 的 EEG 通过 chunked frombuffer 同源加载，
+        确保样本级对齐。避免 MNE read_raw_egi 二次调用挂起问题。
 
         Args:
             eog_channel: 单侧眼电通道，默认 E67 (左眼, 标准 E1 位置)
@@ -2416,31 +2416,45 @@ class SleepEEGFeatureExtractor:
 
         eog_ch = eog_channel
 
-        # ── 验证 EOG 通道 ──
-        if eog_ch not in self.ch_names:
-            print(f"[Step2] ✗ EOG 通道 {eog_ch} 不存在！仅用 EEG 做分期")
+        # ── 获取信号文件实际通道数 (与 MNE 报告的可能不同) ──
+        real_nch = detect_n_channels(self.file_path)
+
+        # ── 通道名 → 列索引 (MNE ch_names 的 EEG 部分与 signal1.bin 列顺序一致) ──
+        eog_idx = self.ch_names.index(eog_ch) if eog_ch in self.ch_names else None
+        eeg_idx = self._eeg_idx  # 在 __init__ 中已计算
+
+        if eog_idx is None:
+            print(f"[Step2] ✗ EOG 通道 {eog_ch} 不在 ch_names 中！仅用 EEG 做分期")
             self.sleep_stages_yasa(eog_channel=None, metadata=metadata)
             return
 
-        # ── MNE 加载 EOG 通道 (pick + load_data, 仅 1 通道 ~60 MB) ──
-        print(f"[Step2] MNE 加载 EOG: {eog_ch}")
+        # ── chunked frombuffer 同时加载 EEG + EOG (同源对齐, ~48 MB) ──
+        print(f"[Step2] chunked 加载 E21 + {eog_ch} (nch={real_nch})...")
         t_load = time.time()
-        raw_eog = mne.io.read_raw_egi(self.file_path, preload=False, verbose=False)
-        raw_eog.pick([eog_ch])
-        raw_eog.load_data()
-        eog_data = raw_eog.get_data(units='uV')[0]  # (n_times,), 与 self.data 同长
-        print(f"[Step2] EOG 加载完成 ({time.time()-t_load:.1f}s) "
-              f"— 与 EEG 同源 MNE, 长度一致")
+        ch_data = _load_channel_data(
+            self.file_path, real_nch, [eeg_idx, eog_idx])
+        eeg_loaded = ch_data[eeg_idx]
+        eog_loaded = ch_data[eog_idx]
+        print(f"[Step2] 加载完成 ({time.time()-t_load:.1f}s) "
+              f"— eeg={len(eeg_loaded)} samples, eog={len(eog_loaded)} samples")
 
-        # ── EEG + 单侧 EOG → RawArray ──
-        eeg_data = self.data                              # 已在 __init__ 中加载, 同长
+        # ── 验证对齐: MNE self.data vs chunked eeg_loaded ──
+        min_len = min(len(self.data), len(eeg_loaded))
+        offset_sec = abs(len(self.data) - len(eeg_loaded)) / self.sfreq
+        if offset_sec > 30:
+            print(f"[Step2] ⚠ 样本数偏差 {offset_sec:.1f}s > 30s!")
+            print(f"  MNE self.data: {len(self.data)}, chunked: {len(eeg_loaded)}")
+        else:
+            print(f"[Step2] 对齐偏差: {offset_sec:.1f}s (MNE={len(self.data)}, chunked={len(eeg_loaded)})")
 
-        combined = np.vstack([eeg_data, eog_data])
+        # 构建 RawArray (用 chunked 加载的 EEG, 确保与 EOG 完美对齐)
+        combined = np.vstack([eeg_loaded[:min_len], eog_loaded[:min_len]])
         info = mne.create_info(
             [self.eeg_channel, eog_ch],
             sfreq=self.sfreq,
             ch_types=['eeg', 'eog'])
         raw_stage = mne.io.RawArray(combined, info, verbose=False)
+        del eeg_loaded, eog_loaded, combined, ch_data
 
         # ── 运行 YASA (LightGBM 模型已内置，秒级加载) ──
         print(f"[Step2] YASA SleepStaging 开始... ")
@@ -2479,7 +2493,7 @@ class SleepEEGFeatureExtractor:
             print(f"[Step2] YASA 失败: {e}")
 
         # ── 清除数据 ──
-        del raw_eog, eog_data, combined, raw_stage
+        del raw_stage
         gc.collect()
         print(f"[Step 2/4] ✓ YASA 分期完成 (EOG 数据已清除)")
 

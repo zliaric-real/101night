@@ -202,3 +202,24 @@ def _load_channel_data_slice(mff_path_str, n_channels, channel_indices,
 
     del channel_chunks; gc.collect()
     return result
+
+
+def detect_n_channels(mff_path_str):
+    """从 signal1.bin 文件大小自动检测实际通道数。
+
+    与 _read_mff_metadata 不同: MNE 报告的名称列表可能包含
+    不在文件中的虚拟通道 (VREF, DIN1 等), 因此必须直接计算
+    signal1.bin 的整除通道数。
+
+    Returns:
+        int: 实际存储在 signal1.bin 中的通道数
+    """
+    signal_path = Path(mff_path_str) / "signal1.bin"
+    file_size = signal_path.stat().st_size
+    total_values = file_size // 4
+    # 优先尝试 257 (常见), 然后 260, 256, ...
+    for n in [257, 260, 256, 261, 259, 258, 269]:
+        if total_values % n == 0:
+            return n
+    # 未找到整除 → 默认 257
+    return 257
