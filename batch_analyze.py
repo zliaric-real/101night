@@ -191,13 +191,33 @@ def process_one_night(rec):
 
         del eeg
 
-        # ── Step 4: YASA 睡眠分期 ──
+        # ── Step 4: YASA 睡眠分期 (细分计时) ──
         t_yasa = time.time()
         log(f"  N{night}: YASA starting... ({n_times/sfreq/3600:.1f}h, {sfreq:.0f}Hz)")
+
+        # 4a. SleepStaging 构造函数 (内部: copy + resample 250→100Hz + get_data)
+        t_init = time.time()
         sls = yasa.SleepStaging(raw_stage, eeg_name=EEG_CH, eog_name=eog_arg)
-        hypno = np.asarray(sls.predict(), dtype=int)  # TF tensor → numpy copy
-        del sls, raw_stage
-        log(f"  N{night}: YASA predict done ({time.time()-t_yasa:.0f}s)")
+        dt_init = time.time() - t_init
+        log(f"  N{night}:   └ SleepStaging.__init__ {dt_init:.1f}s (resample {sfreq:.0f}→100Hz)")
+
+        # 4b. predict() (内部: fit() 滤波 0.4-30Hz + 特征提取 + LightGBM)
+        t_pred = time.time()
+        hypno = np.asarray(sls.predict(), dtype=int)
+        dt_pred = time.time() - t_pred
+        log(f"  N{night}:   └ predict() {dt_pred:.1f}s (filter + features + LGBM)")
+
+        del raw_stage
+        dt_total = time.time() - t_yasa
+        log(f"  N{night}: YASA total {dt_total:.1f}s (init={dt_init:.1f} pred={dt_pred:.1f})")
+
+        # 如果某阶段 >30s, 输出警告并记录内存
+        if max(dt_init, dt_pred) > 30:
+            log(f"  N{night}: ⚠ SLOW phase! init={dt_init:.1f}s pred={dt_pred:.1f}s")
+            if HAS_PSUTIL:
+                mem = psutil.virtual_memory()
+                log(f"  N{night}:   [MEM] {mem.available/1e9:.1f}GB free / {mem.total/1e9:.1f}GB ({mem.percent}% used)")
+        del sls
 
         labels_map = {0: "Wake", 1: "N1", 2: "N2", 3: "N3", 4: "REM"}
         counts = {labels_map.get(s, s): int((hypno == s).sum()) for s in np.unique(hypno)}
