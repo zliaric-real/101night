@@ -165,12 +165,19 @@ class SleepEEGFeatureExtractor:
             eog_channel = None
             self.eog_channel = None
 
-        # ── Step 3: 确定半球代表通道 (parse sensorLayout.xml) ──
-        hemi_indices = self._get_hemispheric_channels(
-            max_per_hemi=max_per_hemi)
-        hemi_names = [self.ch_names[i] for i in hemi_indices]
-        print(f"[init] 半球通道: {len(hemi_names)} 个 "
-              f"(≤{max_per_hemi}/半球)")
+        # ── Step 3: 加载预计算的半球代表通道 (hemi_channels.pkl) ──
+        try:
+            import pickle as _pkl
+            pkl_path = Path(__file__).resolve().parent / "hemi_channels.pkl"
+            with open(pkl_path, 'rb') as _f:
+                _hc = _pkl.load(_f)
+            hemi_names = _hc.get('hemi_names', [])
+            print(f"[init] 加载半球通道: {len(hemi_names)} 个 "
+                  f"(来源: {_hc.get('source_mff', '?')})")
+        except FileNotFoundError:
+            print("[init] ⚠ hemi_channels.pkl 不存在，跳过半球通道")
+            print("[init]   请运行: python hemich_select.py --mff <sample.mff>")
+            hemi_names = []
 
         # ── Step 4: 构建统一 pick_list，去重 ──
         pick_set = {eeg_channel}
@@ -180,40 +187,34 @@ class SleepEEGFeatureExtractor:
         pick_list = sorted(pick_set,
                            key=lambda x: self.ch_names.index(x)
                            if x in self.ch_names else 999)
-        self._pick_list = pick_list  # 记录给外部参考
+        self._pick_list = pick_list
         print(f"[init] 统一加载 {len(pick_list)} 通道: {pick_list}")
 
         # ── Step 5: 一次 MNE pick + load_data ──
         raw.pick(pick_list)
         raw.load_data()
-        self.raw_all = raw.copy()  # 全部已加载通道的 Raw 对象
+        self.raw_all = raw.copy()
 
         # ── Step 6: 派生子视图 ──
-        # raw_stage: EEG+EOG → YASA (不滤波, YASA 内部自行处理)
         stage_chs = [ch for ch in [eeg_channel, eog_channel]
                      if ch and ch in pick_list]
         self.raw_stage = self.raw_all.copy().pick(stage_chs)
 
-        # raw: 仅 EEG → 单通道特征
         self.raw = self.raw_all.copy().pick([eeg_channel])
         self.data = self.raw.get_data(units='uV')[0]
 
         # ── Step 7: 带通滤波 (MNE FIR, zero-phase) ──
-        # 单通道滤波
         self.filted_raw = self.raw.copy().filter(filter_low, filter_high)
         self.filted = self.filted_raw.get_data(units='uV')[0]
 
         # ── Step 8: 预加载半球通道数据 + 滤波 ──
-        # 从 raw_all 提取半球通道，做 MNE FIR 滤波，设入缓存
-        # 这样 Step 3 的特征方法 (functional_connectivity 等)
-        # 通过 _get_filted_all() / _get_roi_data() 直接拿到已滤波数据
         hemi_in_pick = [ch for ch in hemi_names if ch in pick_list]
         if hemi_in_pick:
             raw_hemi = self.raw_all.copy().pick(hemi_in_pick)
-            self._hemi_data_cache = raw_hemi.get_data()  # 未滤波原始数据
+            self._hemi_data_cache = raw_hemi.get_data()
             raw_hemi_filt = raw_hemi.copy().filter(
                 filter_low, filter_high)
-            self._hemi_filted_cache = raw_hemi_filt.get_data()  # 已滤波
+            self._hemi_filted_cache = raw_hemi_filt.get_data()
             self._hemi_ch_names = hemi_in_pick
             del raw_hemi, raw_hemi_filt
             print(f"[init] 半球数据预滤波完成: "
@@ -657,6 +658,8 @@ class SleepEEGFeatureExtractor:
         Returns:
             睡眠分期数组 (0=Wake, 1=N1, 2=N2, 3=N3, 4=REM)
         """
+
+        print(4)
         try:
             # ---- 确定眼电通道 ----
             create_eog = (eog_channel is not None and
@@ -683,26 +686,21 @@ class SleepEEGFeatureExtractor:
                 eog_name=eog_arg,
                 metadata=metadata,
             )
-            hypno_pred = sls.predict()
 
+            print(5)
+            hypno_pred = sls.predict()
+            print(6)
             # ---- 统计分期比例 ----
             labels = {0: 'Wake', 1: 'N1', 2: 'N2', 3: 'N3', 4: 'REM'}
-            stage_counts = {labels.get(s, s): (hypno_pred == s).sum()
-                            for s in np.unique(hypno_pred)}
-            total = len(hypno_pred)
-            stage_pct = {k: f'{v/total*100:.1f}%' for k, v in stage_counts.items()}
 
             self.features['sleep_stages'] = {
                 'stages': hypno_pred,
                 'stage_labels': labels,
-                'stage_counts': stage_counts,
-                'stage_pct': stage_pct,
                 'epoch_length': 30,
                 'total_epochs': len(hypno_pred),
                 'eeg_channel': self.eeg_channel,
                 'eog_channel': eog_channel if create_eog else None,
             }
-            print(f"睡眠分期完成: {stage_pct}")
             return hypno_pred
 
         except Exception as e:
@@ -2492,24 +2490,16 @@ class SleepEEGFeatureExtractor:
             print(f"[Step2]   predict() {time.time()-t_pred:.1f}s")
 
             labels = {0: 'Wake', 1: 'N1', 2: 'N2', 3: 'N3', 4: 'REM'}
-            stage_counts = {labels.get(s, s): int((hypno_pred == s).sum())
-                            for s in np.unique(hypno_pred)}
-            total = len(hypno_pred)
-            stage_pct = {k: f'{v/total*100:.1f}%'
-                         for k, v in stage_counts.items()}
+
 
             self.features['sleep_stages'] = {
                 'stages': hypno_pred,
                 'stage_labels': labels,
-                'stage_counts': stage_counts,
-                'stage_pct': stage_pct,
                 'epoch_length': 30,
                 'total_epochs': len(hypno_pred),
                 'eeg_channel': self.eeg_channel,
                 'eog_channel': eog_ch,
             }
-            print(f"[Step2] YASA 完成 ({time.time()-t_yasa:.0f}s): "
-                  f"{stage_pct}")
 
             del sls
         except Exception as e:
