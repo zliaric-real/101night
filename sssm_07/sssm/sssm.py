@@ -15,6 +15,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 
 
 class Model(ClassifierMixin, BaseEstimator):
+
     def __init__(self, device='cuda', model_name='model.pt', model_path=None, ):
         """
         if model_path is None, use default model path, you can select default model by setting model_name;
