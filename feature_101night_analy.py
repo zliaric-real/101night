@@ -121,76 +121,113 @@ class SleepEEGFeatureExtractor:
     def __init__(self, file_path, eeg_channel='E21',
                  eog_channel='E61',
                  load_all_channels: bool = True,
+                 max_per_hemi: int = 5,
                  filter_low: float = 0.1,
                  filter_high: float = 40.0):
-        """
-        初始化特征提取器
+        """初始化特征提取器 — 全部通道数据通过 MNE 一次加载。
 
-        - 使用 MNE mne.io.read_raw_egi 加载 .mff 文件
-        - 滤波使用 MNE 默认 FIR 设计 (firwin, zero-phase, 自动阶数)
-        - 单通道: 仅加载目标通道，内存 ~60 MB
-        - 多通道: 惰性加载 (lazy)，仅在首次调用多通道特征方法时从磁盘读取
-          通过 chunked frombuffer 加载，避免 MNE 全通道预加载的内存问题
+        - 全部 .mff 数据读取走 MNE read_raw_egi → pick → load_data
+        - 不使用 chunked frombuffer / _load_channel_data（仅 Step 4 源定位例外，暂搁置）
+        - 在 __init__ 中一次性确定并加载前三步所需全部通道：
+            E21 (EEG) + E61 (EOG) + 半球代表通道 (~10ch)
 
         Args:
             file_path: .mff文件路径
-            eeg_channel: 用于单通道分析的主要EEG通道名称
-            load_all_channels: 是否允许多通道特征 (惰性加载)
+            eeg_channel: 主要 EEG 通道
+            eog_channel: 眼电通道 (单侧)
+            load_all_channels: 是否允许后续多通道特征
+            max_per_hemi: Step 3 每半球最多通道数
             filter_low: 带通滤波低频截止 (Hz)
             filter_high: 带通滤波高频截止 (Hz)
         """
         self.file_path = file_path
         self.eeg_channel = eeg_channel
+        self.eog_channel = eog_channel
         self.filter_low = filter_low
         self.filter_high = filter_high
+        self._load_all = load_all_channels
+        self.max_per_hemi = max_per_hemi
 
-        # ── Step 1: MNE 加载元数据 (不预加载数据) ──
+        # ── Step 1: MNE 读取元数据 (不预加载数据) ──
         raw = mne.io.read_raw_egi(file_path, preload=False, verbose=False)
         self.ch_names = raw.ch_names
         self.n_channels = len(raw.ch_names)
         self.sfreq = int(raw.info['sfreq'])
 
-        # ── Step 2: 检查通道 ──
+        # ── Step 2: 验证通道 ──
         if eeg_channel not in self.ch_names:
             eeg_channel = self.ch_names[10]
             self.eeg_channel = eeg_channel
         self._eeg_idx = self.ch_names.index(eeg_channel)
 
-        # 检查 EOG 通道
         if eog_channel and eog_channel not in self.ch_names:
-            print(f"[init] ⚠ EOG 通道 {eog_channel} 不存在，不使用 EOG")
+            print(f"[init] ⚠ EOG {eog_channel} 不存在，不使用 EOG")
             eog_channel = None
-        self.eog_channel = eog_channel
+            self.eog_channel = None
 
-        # ── Step 3: 一次 pick 加载 EEG+EOG (notebook 验证路径) ──
-        pick_list = [eeg_channel]
+        # ── Step 3: 确定半球代表通道 (parse sensorLayout.xml) ──
+        hemi_indices = self._get_hemispheric_channels(
+            max_per_hemi=max_per_hemi)
+        hemi_names = [self.ch_names[i] for i in hemi_indices]
+        print(f"[init] 半球通道: {len(hemi_names)} 个 "
+              f"(≤{max_per_hemi}/半球)")
+
+        # ── Step 4: 构建统一 pick_list，去重 ──
+        pick_set = {eeg_channel}
         if eog_channel:
-            pick_list.append(eog_channel)
+            pick_set.add(eog_channel)
+        pick_set.update(hemi_names)
+        pick_list = sorted(pick_set,
+                           key=lambda x: self.ch_names.index(x)
+                           if x in self.ch_names else 999)
+        self._pick_list = pick_list  # 记录给外部参考
+        print(f"[init] 统一加载 {len(pick_list)} 通道: {pick_list}")
+
+        # ── Step 5: 一次 MNE pick + load_data ──
         raw.pick(pick_list)
         raw.load_data()
+        self.raw_all = raw.copy()  # 全部已加载通道的 Raw 对象
 
-        # raw_stage: 双通道 Raw 对象，直接给 YASA (不滤波, YASA 内部自行处理)
-        self.raw_stage = raw.copy()
+        # ── Step 6: 派生子视图 ──
+        # raw_stage: EEG+EOG → YASA (不滤波, YASA 内部自行处理)
+        stage_chs = [ch for ch in [eeg_channel, eog_channel]
+                     if ch and ch in pick_list]
+        self.raw_stage = self.raw_all.copy().pick(stage_chs)
 
-        # raw: 只保留 EEG 单通道，用于特征提取
-        self.raw = raw.copy().pick([eeg_channel])
-        self.data = self.raw.get_data(units='uV')[0]  # 1D float64, ~60 MB
+        # raw: 仅 EEG → 单通道特征
+        self.raw = self.raw_all.copy().pick([eeg_channel])
+        self.data = self.raw.get_data(units='uV')[0]
 
-        # ── Step 3b: MNE 默认 FIR 滤波 (firwin, zero-phase, 自动阶数) ──
+        # ── Step 7: 带通滤波 (MNE FIR, zero-phase) ──
+        # 单通道滤波
         self.filted_raw = self.raw.copy().filter(filter_low, filter_high)
         self.filted = self.filted_raw.get_data(units='uV')[0]
 
-        # ── Step 4: 多通道惰性加载 ──
-        self._load_all = load_all_channels
-        self._data_all = None      # lazy: loaded on first access
-        self._filted_cache = None  # lazy: filtered version
+        # ── Step 8: 预加载半球通道数据 + 滤波 ──
+        # 从 raw_all 提取半球通道，做 MNE FIR 滤波，设入缓存
+        # 这样 Step 3 的特征方法 (functional_connectivity 等)
+        # 通过 _get_filted_all() / _get_roi_data() 直接拿到已滤波数据
+        hemi_in_pick = [ch for ch in hemi_names if ch in pick_list]
+        if hemi_in_pick:
+            raw_hemi = self.raw_all.copy().pick(hemi_in_pick)
+            self._hemi_data_cache = raw_hemi.get_data()  # 未滤波原始数据
+            raw_hemi_filt = raw_hemi.copy().filter(
+                filter_low, filter_high)
+            self._hemi_filted_cache = raw_hemi_filt.get_data()  # 已滤波
+            self._hemi_ch_names = hemi_in_pick
+            del raw_hemi, raw_hemi_filt
+            print(f"[init] 半球数据预滤波完成: "
+                  f"{self._hemi_filted_cache.shape}")
+
+        # ── Step 9: 其他初始化 ──
+        self._data_all = None
+        self._filted_cache = None
         self._eeg_ch_indices = [i for i, ch in enumerate(self.ch_names)
                                 if ch.startswith('E') and ch[1:].isdigit()]
-        self.n_times = self.data.size  # 兼容 _get_data_all 等方法
-
-        # ── 存储提取的特征 ──
+        self.n_times = self.data.size
         self.features = {}
         self._epoch_info = {}
+
 
     # ================================================================
     #  Part 0 — 工具方法
@@ -604,7 +641,7 @@ class SleepEEGFeatureExtractor:
             return None
 
     def sleep_stages_yasa(self,
-                          eog_channel='E67',
+                          eog_channel='E61',
                           metadata=None):
         """
         使用 YASA 进行自动睡眠分期。
@@ -612,14 +649,9 @@ class SleepEEGFeatureExtractor:
         YASA 标准输入要求:
           - eeg_name: 中央区 EEG 导联 (如 C3-M2, 这里用 E21 近似 Cz)
           - eog_name: 眼电导联 (提高 Wake/REM 判别准确率)
-          - emg_name: 颏肌电导联 (EGI 256导无此导联, 跳过)
-
-        EGI 256导中眼电导联 (基于坐标分析):
-          - 左眼: E67 (x=-0.077, z=-0.003, 最前外侧)
-          - 右眼: E219 (x=+0.077, z=-0.003)
 
         Args:
-            eog_channel: 单侧眼电通道, 默认 'E67' (左眼)
+            eog_channel: 单侧眼电通道, 默认 'E61'
             metadata: 可选元数据 dict, 如 {'age': 30, 'male': 0}
 
         Returns:
@@ -2492,14 +2524,11 @@ class SleepEEGFeatureExtractor:
                                     max_per_hemi=5,
                                     groups=('connectivity', 'microstates',
                                             'spatial')):
-        """Step 3: 多通道特征 — 半球分区 ROI，每半球 ≤5 代表通道。
+        """Step 3: 多通道特征 — 半球分区 ROI，数据已在 __init__ 预加载。
 
-        从 sensorLayout.xml 解析通道 3D 坐标，按 x 坐标分左右半球。
-        每半球内 y-z 平面 k-means(k=5) 聚类，覆盖额叶/中央/颞叶/
-        顶叶/枕叶区域。选每类距质心最近的通道 → 共 ≤10 通道。
-
-        仅加载这 ~10 个通道（~600 MB vs 全 260 通道的 7.5 GB），
-        做完连接性/微状态/空间/图论特征后立即清除。
+        __init__ 中已通过 MNE 一次性加载全部所需通道并预滤波，
+        存储于 _hemi_data_cache / _hemi_filted_cache。
+        本方法直接从缓存取数运行特征，不读取磁盘。
 
         Args:
             epoch_sec: epoch 长度
@@ -2513,35 +2542,38 @@ class SleepEEGFeatureExtractor:
         print(f"[Step 3/4] 多通道 ROI 特征 (半球≤{max_per_hemi}通道/侧)")
         print(f"{'='*60}\n")
 
-        # ── 1. 选择半球代表通道 ──
+        # ── 1. 获取半球代表通道 (缓存结果) ──
         hemi_indices = self._get_hemispheric_channels(
             max_per_hemi=max_per_hemi)
         n_hemi = len(hemi_indices)
         print(f"[Step3] 选中 {n_hemi} 个代表通道")
 
-        # ── 2. 加载通道数据 (chunked frombuffer) ──
-        t_load = time.time()
-        ch_data = _load_channel_data(
-            self.file_path, self.n_channels, hemi_indices)
-        data = np.stack([ch_data[i] for i in hemi_indices], axis=0)
-        print(f"[Step3] 数据加载: {data.shape}, "
-              f"{data.nbytes/1e6:.0f} MB ({time.time()-t_load:.1f}s)")
+        # ── 2. 验证缓存数据可用 ──
+        if (not hasattr(self, '_hemi_data_cache')
+                or self._hemi_data_cache is None):
+            print("[Step3] ✗ 半球数据缓存未初始化！")
+            return
+        if (not hasattr(self, '_hemi_filted_cache')
+                or self._hemi_filted_cache is None):
+            print("[Step3] ✗ 半球滤波缓存未初始化！")
+            return
 
-        # ── 3. MNE FIR 滤波 ──
-        t_filt = time.time()
-        info = mne.create_info(
-            [self.ch_names[i] for i in hemi_indices],
-            self.sfreq, ch_types=['eeg'] * n_hemi)
-        raw_hemi = mne.io.RawArray(data, info, verbose=False)
-        raw_hemi.filter(self.filter_low, self.filter_high)
-        filted = raw_hemi.get_data()
-        print(f"[Step3] 滤波完成 ({time.time()-t_filt:.1f}s)")
+        n_loaded = self._hemi_filted_cache.shape[0]
+        print(f"[Step3] 已预加载 {n_loaded} 通道 "
+              f"({self._hemi_filted_cache.nbytes/1e6:.0f} MB, 已滤波)")
 
-        # ── 4. 设置半球缓存 ──
-        self._hemi_data_cache = data
-        self._hemi_filted_cache = filted
-        self._hemi_ch_names = [self.ch_names[i] for i in hemi_indices]
-        # 临时启用多通道模式（使各特征方法放行）
+        # 如果 max_per_hemi 变化导致选中通道数不同，发出警告
+        if n_hemi != n_loaded:
+            print(f"[Step3] ⚠ 选中 {n_hemi} 通道 ≠ 预加载 {n_loaded} 通道"
+                  f" — 使用预加载数据")
+
+        # ── 3. 设置半球缓存 (已在 __init__ 预填充，这里确认) ──
+        # _hemi_ch_names 已在 __init__ 设置
+        if not hasattr(self, '_hemi_ch_names') or not self._hemi_ch_names:
+            self._hemi_ch_names = [self.ch_names[i] for i in hemi_indices]
+        print(f"[Step3] 通道: {self._hemi_ch_names}")
+
+        # ── 4. 临时启用多通道模式 ──
         _load_all_saved = self._load_all
         self._load_all = True
 
@@ -2570,7 +2602,6 @@ class SleepEEGFeatureExtractor:
                        '_hemi_ch_names'):
             if hasattr(self, _attr):
                 delattr(self, _attr)
-        del data, filted, ch_data, raw_hemi
         self._clear_cache('roi')
         print(f"[Step 3/4] ✓ 多通道 ROI 特征完成 (缓存已清除)")
 
@@ -2831,7 +2862,7 @@ class SleepEEGFeatureExtractor:
             skip_sssm: 跳过 SSSM 特征波检测
             skip_source_loc: 跳过 Step 4 源定位
             source_method: 逆解方法 'eLORETA'/'dSPM'/'MNE'
-            yasa_eog_channel: 单侧眼电通道，默认 'E67' (左眼)
+            yasa_eog_channel: 单侧眼电通道，默认 'E61'
             yasa_metadata: YASA 可选元数据
             max_per_hemi: Step 3 每半球最多通道数 (默认 5)
         """

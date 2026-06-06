@@ -47,7 +47,7 @@ def main():
     parser.add_argument('--night', type=int, required=True)
     parser.add_argument('--output', default=None)
     parser.add_argument('--eeg-channel', default='E21')
-    parser.add_argument('--eog-channel', default='E67')
+    parser.add_argument('--eog-channel', default='E61')
     parser.add_argument('--epoch-sec', type=float, default=30)
     parser.add_argument('--max-per-hemi', type=int, default=5)
     parser.add_argument('--skip-yasa', action='store_true')
