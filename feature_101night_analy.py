@@ -589,8 +589,7 @@ class SleepEEGFeatureExtractor:
             return None
 
     def sleep_stages_yasa(self,
-                          eog_channels=None,
-                          create_bipolar_eog=True,
+                          eog_channel='E67',
                           metadata=None):
         """
         使用 YASA 进行自动睡眠分期。
@@ -600,14 +599,12 @@ class SleepEEGFeatureExtractor:
           - eog_name: 眼电导联 (提高 Wake/REM 判别准确率)
           - emg_name: 颏肌电导联 (EGI 256导无此导联, 跳过)
 
-        EGI 256导中眼电对应导联 (基于坐标分析, z≈0, |x|最大):
-          - 左眼区域: E67 (x=-0.077, z=-0.003)  /  E68 (x=-0.077, z=0.015)
-          - 右眼区域: E219 (x=+0.077, z=-0.003) / E210 (x=+0.077, z=0.015)
-          默认创建双极导联 EOG = E67 - E219
+        EGI 256导中眼电导联 (基于坐标分析):
+          - 左眼: E67 (x=-0.077, z=-0.003, 最前外侧)
+          - 右眼: E219 (x=+0.077, z=-0.003)
 
         Args:
-            eog_channels: 自定义眼电通道对 (left, right), None 使用默认 E67/E219
-            create_bipolar_eog: 是否创建双极 EOG 导联
+            eog_channel: 单侧眼电通道, 默认 'E67' (左眼)
             metadata: 可选元数据 dict, 如 {'age': 30, 'male': 0}
 
         Returns:
@@ -615,33 +612,21 @@ class SleepEEGFeatureExtractor:
         """
         try:
             # ---- 确定眼电通道 ----
-            if eog_channels is None:
-                eog_channels = ('E67', 'E219')  # 基于坐标的最前外侧导联
+            create_eog = (eog_channel is not None and
+                          eog_channel in self.raw.ch_names)
 
-            eog_left, eog_right = eog_channels
-
-            # 验证通道存在
-            for ch in [eog_left, eog_right]:
-                if ch not in self.raw.ch_names:
-                    print(f"[YASA] 警告: EOG 候选通道 {ch} 不存在, 仅使用 EEG")
-                    create_bipolar_eog = False
-                    break
-
-            # ---- 准备 Raw 对象 (含双极 EOG) ----
-            if create_bipolar_eog:
-                # 创建双极 EOG: left - right (捕获水平眼动)
-                eog_data = (self.raw.get_data(picks=[eog_left])[0] -
-                            self.raw.get_data(picks=[eog_right])[0])
+            # ---- 准备 Raw 对象 ----
+            if create_eog:
+                eog_data = self.raw.get_data(picks=[eog_channel])[0]
                 eeg_data = self.raw.get_data(picks=[self.eeg_channel])[0]
-                # 组合为双通道 RawArray
                 combined_data = np.vstack([eeg_data, eog_data])
                 combined_info = mne.create_info(
-                    [self.eeg_channel, 'EOG'],
+                    [self.eeg_channel, eog_channel],
                     sfreq=self.raw.info['sfreq'],
                     ch_types=['eeg', 'eog']
                 )
                 raw_stage = mne.io.RawArray(combined_data, combined_info)
-                eog_arg = 'EOG'
+                eog_arg = eog_channel
             else:
                 raw_stage = self.raw.copy().pick([self.eeg_channel])
                 eog_arg = None
@@ -668,7 +653,7 @@ class SleepEEGFeatureExtractor:
                 'epoch_length': 30,
                 'total_epochs': len(hypno_pred),
                 'eeg_channel': self.eeg_channel,
-                'eog_channels': eog_channels if create_bipolar_eog else None,
+                'eog_channel': eog_channel if create_eog else None,
             }
             print(f"睡眠分期完成: {stage_pct}")
             return hypno_pred
@@ -2410,17 +2395,16 @@ class SleepEEGFeatureExtractor:
         print(f"\n[Step 1/4] ✓ 单通道特征提取完成")
 
     def run_step2_yasa_with_eog(self,
-                                 eog_channels=('E67', 'E219'),
+                                 eog_channel='E67',
                                  metadata=None):
-        """Step 2: YASA 睡眠分期 — EEG+EOG 均通过 MNE 加载。
+        """Step 2: YASA 睡眠分期 — EEG + 单侧 EOG。
 
         E21 已在 __init__ 中加载为 self.data。EOG 单独通过 MNE
-        read_raw_egi(pick+load_data) 加载，只需 ~120 MB（仅 2 通道）。
-        两者来自相同 MNE parser → 长度一致 → 天然对齐 → 与 Step 1 epoch 也一致。
+        read_raw_egi(pick+load_data) 加载，只需 ~60 MB（仅 1 通道）。
+        两者来自相同 MNE parser → 长度一致 → 天然对齐。
 
         Args:
-            eog_channels: (left, right) EOG 通道对，
-                          默认 E67/E219（EGI 256 最前外侧导联）
+            eog_channel: 单侧眼电通道，默认 E67 (左眼, 标准 E1 位置)
             metadata: YASA 可选元数据 {'age': 30, 'male': 0}
         """
         import gc
@@ -2430,35 +2414,30 @@ class SleepEEGFeatureExtractor:
         print(f"[Step 2/4] YASA 睡眠分期 (EEG+EOG, MNE)")
         print(f"{'='*60}\n")
 
-        eog_left, eog_right = eog_channels
+        eog_ch = eog_channel
 
         # ── 验证 EOG 通道 ──
-        for ch in [eog_left, eog_right]:
-            if ch not in self.ch_names:
-                print(f"[Step2] ✗ EOG 通道 {ch} 不存在！仅用 EEG 做分期")
-                self.sleep_stages_yasa(
-                    eog_channels=eog_channels,
-                    create_bipolar_eog=False,
-                    metadata=metadata)
-                return
+        if eog_ch not in self.ch_names:
+            print(f"[Step2] ✗ EOG 通道 {eog_ch} 不存在！仅用 EEG 做分期")
+            self.sleep_stages_yasa(eog_channel=None, metadata=metadata)
+            return
 
-        # ── MNE 加载 EOG 通道 (pick + load_data, 仅 2 通道 ~120 MB) ──
-        print(f"[Step2] MNE 加载 EOG: {eog_left}, {eog_right}")
+        # ── MNE 加载 EOG 通道 (pick + load_data, 仅 1 通道 ~60 MB) ──
+        print(f"[Step2] MNE 加载 EOG: {eog_ch}")
         t_load = time.time()
         raw_eog = mne.io.read_raw_egi(self.file_path, preload=False, verbose=False)
-        raw_eog.pick([eog_left, eog_right])
+        raw_eog.pick([eog_ch])
         raw_eog.load_data()
-        eog_data = raw_eog.get_data(units='uV')  # (2, n_times), 与 self.data 同长
+        eog_data = raw_eog.get_data(units='uV')[0]  # (n_times,), 与 self.data 同长
         print(f"[Step2] EOG 加载完成 ({time.time()-t_load:.1f}s) "
               f"— 与 EEG 同源 MNE, 长度一致")
 
-        # ── 双极 EOG + EEG → RawArray ──
-        eog_bipolar = eog_data[0] - eog_data[1]          # E67 - E219
+        # ── EEG + 单侧 EOG → RawArray ──
         eeg_data = self.data                              # 已在 __init__ 中加载, 同长
 
-        combined = np.vstack([eeg_data, eog_bipolar])
+        combined = np.vstack([eeg_data, eog_data])
         info = mne.create_info(
-            [self.eeg_channel, 'EOG'],
+            [self.eeg_channel, eog_ch],
             sfreq=self.sfreq,
             ch_types=['eeg', 'eog'])
         raw_stage = mne.io.RawArray(combined, info, verbose=False)
@@ -2470,7 +2449,7 @@ class SleepEEGFeatureExtractor:
             sls = yasa.SleepStaging(
                 raw_stage,
                 eeg_name=self.eeg_channel,
-                eog_name='EOG',
+                eog_name=eog_ch,
                 metadata=metadata,
             )
             hypno_pred = np.asarray(sls.predict(), dtype=int)
@@ -2490,7 +2469,7 @@ class SleepEEGFeatureExtractor:
                 'epoch_length': 30,
                 'total_epochs': len(hypno_pred),
                 'eeg_channel': self.eeg_channel,
-                'eog_channels': eog_channels,
+                'eog_channel': eog_ch,
             }
             print(f"[Step2] YASA 完成 ({time.time()-t_yasa:.0f}s): "
                   f"{stage_pct}")
@@ -2500,7 +2479,7 @@ class SleepEEGFeatureExtractor:
             print(f"[Step2] YASA 失败: {e}")
 
         # ── 清除数据 ──
-        del raw_eog, eog_data, eog_bipolar, combined, raw_stage
+        del raw_eog, eog_data, combined, raw_stage
         gc.collect()
         print(f"[Step 2/4] ✓ YASA 分期完成 (EOG 数据已清除)")
 
@@ -2826,7 +2805,7 @@ class SleepEEGFeatureExtractor:
                 skip_sssm: bool = False,
                 skip_source_loc: bool = False,
                 source_method: str = 'eLORETA',
-                yasa_eog_channels=None,
+                yasa_eog_channel='E67',
                 yasa_metadata=None,
                 max_per_hemi: int = 5):
         """一键运行全部特征提取 — 4 步线性流水线。
@@ -2847,7 +2826,7 @@ class SleepEEGFeatureExtractor:
             skip_sssm: 跳过 SSSM 特征波检测
             skip_source_loc: 跳过 Step 4 源定位
             source_method: 逆解方法 'eLORETA'/'dSPM'/'MNE'
-            yasa_eog_channels: EOG 通道对，默认 ('E67', 'E219')
+            yasa_eog_channel: 单侧眼电通道，默认 'E67' (左眼)
             yasa_metadata: YASA 可选元数据
             max_per_hemi: Step 3 每半球最多通道数 (默认 5)
         """
@@ -2873,9 +2852,8 @@ class SleepEEGFeatureExtractor:
 
         # ── Step 2: YASA 分期 (EOG 增强) ──
         if not skip_yasa:
-            eog_ch = yasa_eog_channels or ('E67', 'E219')
             self.run_step2_yasa_with_eog(
-                eog_channels=eog_ch,
+                eog_channel=yasa_eog_channel,
                 metadata=yasa_metadata)
             print(f"  [内存] Step 2 EOG 已清除, 单通道保留")
         else:

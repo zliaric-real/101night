@@ -1,7 +1,7 @@
 """
 batch_analyze.py — 101-nights 批处理与可视化 (高效版)
 ========================================================
-仅加载 YASA 所需的 3 通道 (E21 + E67 + E219), 大幅加速批处理。
+仅加载 YASA 所需的 2 通道 (E21 + E67), 大幅加速批处理。
 按日期排序，生成睡眠分期和特征波统计可视化。
 
 用法: python batch_analyze.py
@@ -45,7 +45,7 @@ WAVE_COLORS = {"Background":"#cccccc","Spindle":"#377eb8","Slow wave":"#4daf4a",
                "K-complex":"#984ea3","Sawtooth":"#ff7f00","Vertex sharp":"#a65628","Arousal":"#f781bf"}
 
 EEG_CH = "E21"
-EOG_L, EOG_R = "E67", "E219"
+EOG_CH = "E67"  # 单侧眼电 (左眼, 标准 E1 位置)
 
 # ── 日志 ──
 def log(msg):
@@ -125,9 +125,8 @@ def process_one_night(rec):
             return result
 
         eeg_idx = ch_map[EEG_CH]
-        eogL_idx = ch_map.get(EOG_L)
-        eogR_idx = ch_map.get(EOG_R)
-        have_eog = eogL_idx is not None and eogR_idx is not None
+        eog_idx = ch_map.get(EOG_CH)
+        have_eog = eog_idx is not None
 
         # ── Step 3: 预分配缓冲区读取 signal1.bin ──
         # 使用 np.frombuffer + 预分配缓冲区替代 np.fromfile()：
@@ -139,8 +138,7 @@ def process_one_night(rec):
         CHUNK_VALUES = 500_000
         CHUNK_BYTES = CHUNK_VALUES * 4  # float32 = 4 bytes
         eeg_chunks = []
-        eogL_chunks = [] if have_eog else None
-        eogR_chunks = [] if have_eog else None
+        eog_chunks = [] if have_eog else None
 
         # 预分配一次，全循环复用
         _buf = np.empty(CHUNK_VALUES, dtype=np.float32)
@@ -166,8 +164,7 @@ def process_one_night(rec):
                 chunk_2d = chunk[:n_samples * n_channels].reshape(n_samples, n_channels)
                 eeg_chunks.append(chunk_2d[:, eeg_idx].copy())
                 if have_eog:
-                    eogL_chunks.append(chunk_2d[:, eogL_idx].copy())
-                    eogR_chunks.append(chunk_2d[:, eogR_idx].copy())
+                    eog_chunks.append(chunk_2d[:, eog_idx].copy())
 
         # 拼接 + 转换
         eeg = np.concatenate(eeg_chunks).astype("float64")  # signal1.bin 已是 μV
@@ -175,17 +172,15 @@ def process_one_night(rec):
         eeg_mb = eeg.nbytes / 1e6
 
         if have_eog:
-            eogL = np.concatenate(eogL_chunks).astype("float64")  # signal1.bin 已是 μV
-            eogR = np.concatenate(eogR_chunks).astype("float64")  # signal1.bin 已是 μV
-            eog = eogL - eogR
-            del eogL, eogR, eogL_chunks, eogR_chunks
-            log(f"  N{night}: data loaded — EEG {eeg_mb:.0f}MB, EOG bipolar ({time.time()-t_read:.0f}s)")
+            eog = np.concatenate(eog_chunks).astype("float64")  # 单侧 E67, 已是 μV
+            del eog_chunks
+            log(f"  N{night}: data loaded — EEG {eeg_mb:.0f}MB, EOG {EOG_CH} ({time.time()-t_read:.0f}s)")
             combined = np.vstack([eeg, eog])
             del eog
-            info = mne.create_info([EEG_CH, "EOG"], sfreq, ch_types=["eeg", "eog"])
+            info = mne.create_info([EEG_CH, EOG_CH], sfreq, ch_types=["eeg", "eog"])
             raw_stage = mne.io.RawArray(combined, info, verbose=False)
             del combined
-            eog_arg = "EOG"
+            eog_arg = EOG_CH
         else:
             log(f"  N{night}: data loaded — EEG {eeg_mb:.0f}MB (no EOG) ({time.time()-t_read:.0f}s)")
             raw_stage = mne.io.RawArray(

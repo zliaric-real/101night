@@ -2,14 +2,14 @@
 """
 step2_yasa_staging.py — Step 2: YASA 睡眠分期 (独立进程)
 ========================================================
-通过 MNE 加载 EOG (E67/E219)，与 self.data (E21) 同源同长，
+通过 MNE 加载 EOG (E67)，与 self.data (E21) 同源同长，
 送 YASA SleepStaging 做 EEG+EOG 五期分类 (Wake/N1/N2/N3/REM)。
 
 进程退出后 OS 自动回收全部内存。
 
 用法:
   python step2_yasa_staging.py --mff I:/.../Nathalie-40_...mff --night 40
-  python step2_yasa_staging.py --mff ... --night 40 --eog E68 E210
+  python step2_yasa_staging.py --mff ... --night 40 --eog-channel E219
 """
 
 import sys
@@ -28,7 +28,7 @@ def main():
     parser.add_argument('--night', type=int, required=True)
     parser.add_argument('--output', default=None, help='输出目录 (默认: 当前目录)')
     parser.add_argument('--eeg-channel', default='E21')
-    parser.add_argument('--eog-channels', nargs=2, default=['E67', 'E219'])
+    parser.add_argument('--eog-channel', default='E67')
     args = parser.parse_args()
 
     out_dir = Path(args.output) if args.output else PROJECT_DIR
@@ -36,7 +36,7 @@ def main():
 
     print(f"\n{'#'*60}")
     print(f"# Step 2 — YASA 睡眠分期 (Night {night})")
-    print(f"# EEG: {args.eeg_channel}, EOG: {args.eog_channels}")
+    print(f"# EEG: {args.eeg_channel}, EOG: {args.eog_channel}")
     print(f"{'#'*60}\n")
     t0 = time.time()
 
@@ -50,7 +50,7 @@ def main():
         print(f"[N{night}] 初始化 ({time.time()-t0:.0f}s)")
 
         ext.run_step2_yasa_with_eog(
-            eog_channels=tuple(args.eog_channels))
+            eog_channel=args.eog_channel)
 
         pkl_path = out_dir / f"features_night{night}_step2.pkl"
         ext.save_features(str(pkl_path))

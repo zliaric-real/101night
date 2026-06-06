@@ -47,7 +47,7 @@ def main():
     parser.add_argument('--night', type=int, required=True)
     parser.add_argument('--output', default=None)
     parser.add_argument('--eeg-channel', default='E21')
-    parser.add_argument('--eog-channels', nargs=2, default=['E67', 'E219'])
+    parser.add_argument('--eog-channel', default='E67')
     parser.add_argument('--epoch-sec', type=float, default=30)
     parser.add_argument('--max-per-hemi', type=int, default=5)
     parser.add_argument('--skip-yasa', action='store_true')
@@ -91,8 +91,7 @@ def main():
 
     # ── Step 2: YASA 分期 ──
     if 2 in steps_to_run and not args.skip_yasa:
-        step2_args = base_args + [
-            '--eog-channels', args.eog_channels[0], args.eog_channels[1]]
+        step2_args = base_args + ['--eog-channel', args.eog_channel]
         ok, elapsed = run_step('step2_yasa_staging.py', step2_args, night)
         results[2] = ok
     elif 2 in steps_to_run:
