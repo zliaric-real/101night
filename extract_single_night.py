@@ -1,116 +1,131 @@
 # -*- coding: utf-8 -*-
 """
-extract_single_night.py — 单夜特征提取子进程 (3步模式，不含源定位)
-==================================================================
-被 run_pipeline.py 以 subprocess 调用，独立运行一个夜晚的特征提取。
+extract_single_night.py — 单夜特征提取编排器 (subprocess 模式)
+==============================================================
+依次调用 4 个独立 step 脚本，每个作为子进程运行：
+  step1_single_channel.py — 单通道特征 + SSSM
+  step2_yasa_staging.py   — YASA 睡眠分期
+  step3_multichannel.py   — 多通道 ROI 特征
+  step4_source_loc.py     — 源定位 (默认跳过)
 
-3步线性流水线：
-  Step 1: 单通道特征 (E21≈Cz) — 频谱/时域/熵/复杂度/tsfresh/RQA/SSSM
-  Step 2: YASA 睡眠分期 (EEG+EOG) — 加载 EOG 通道，分期后清除
-  Step 3: 多通道 ROI 特征 — 半球分区 (≤5通道/侧)，提取后清除
-  (Step 4 源定位已禁用 — 内存过大，暂不执行)
+每个子进程退出 = OS 自动回收全部内存，杜绝泄漏。
 
 用法:
   python extract_single_night.py --mff I:/101Night/Nathalie-40_...mff --night 40
-  python extract_single_night.py --mff ... --night 40 --skip-yasa   # 跳过 YASA
+  python extract_single_night.py --mff ... --night 40 --steps 1,2,3       # 只跑指定步骤
+  python extract_single_night.py --mff ... --night 40 --skip-yasa         # 跳过 YASA
 """
 
 import sys
-import gc
+import subprocess
 import time
 import argparse
 from pathlib import Path
 
-# ── 项目路径 ──
 PROJECT_DIR = Path(__file__).resolve().parent
+PYTHON = sys.executable  # 使用同一 Python 解释器
+
+
+def run_step(step_script, args_list, night):
+    """运行单个 step 子进程，返回 (success, elapsed_sec)."""
+    cmd = [PYTHON, str(PROJECT_DIR / step_script)] + args_list
+    print(f"\n--- 启动 {step_script} ---")
+    print(f"  {' '.join(cmd)}\n")
+    t0 = time.time()
+    result = subprocess.run(cmd, cwd=str(PROJECT_DIR))
+    elapsed = time.time() - t0
+    success = result.returncode == 0
+    status = "✓" if success else f"✗ (exit={result.returncode})"
+    print(f"\n--- {step_script} {status} ({elapsed:.0f}s) ---")
+    return success, elapsed
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='单夜特征提取 (3步流水线)')
+        description='单夜特征提取编排器 (subprocess 模式)')
     parser.add_argument('--mff', required=True, help='.mff 目录路径')
     parser.add_argument('--night', type=int, required=True)
-    parser.add_argument('--output', default=None,
-                        help='输出目录 (默认: 当前目录)')
-    parser.add_argument('--eeg-channel', default='E21',
-                        help='主EEG通道 (默认: E21≈Cz)')
-    parser.add_argument('--eog-channels', nargs=2, default=['E67', 'E219'],
-                        help='EOG通道对 (默认: E67 E219)')
-    parser.add_argument('--epoch-sec', type=float, default=30,
-                        help='Epoch长度/秒 (默认: 30)')
-    parser.add_argument('--max-per-hemi', type=int, default=5,
-                        help='Step3每半球最多通道 (默认: 5)')
-    parser.add_argument('--skip-yasa', action='store_true',
-                        help='跳过 Step 2 (YASA 睡眠分期)')
-    parser.add_argument('--skip-sssm', action='store_true',
-                        help='跳过 SSSM 特征波检测')
+    parser.add_argument('--output', default=None)
+    parser.add_argument('--eeg-channel', default='E21')
+    parser.add_argument('--eog-channels', nargs=2, default=['E67', 'E219'])
+    parser.add_argument('--epoch-sec', type=float, default=30)
+    parser.add_argument('--max-per-hemi', type=int, default=5)
+    parser.add_argument('--skip-yasa', action='store_true')
+    parser.add_argument('--skip-sssm', action='store_true')
+    parser.add_argument('--skip-source', action='store_true',
+                        help='跳过 Step 4 源定位 (默认跳过)')
+    parser.add_argument('--source-method', default='eLORETA',
+                        choices=['eLORETA', 'dSPM', 'MNE'])
+    parser.add_argument('--slice-sec', type=float, default=600)
+    parser.add_argument('--steps', default='1,2,3',
+                        help='要运行的步骤 (逗号分隔, 默认: 1,2,3)')
     args = parser.parse_args()
 
     out_dir = Path(args.output) if args.output else PROJECT_DIR
     night = args.night
-    mff_path = args.mff
+    steps_to_run = [int(s.strip()) for s in args.steps.split(',')]
 
     print(f"\n{'#'*60}")
-    print(f"# Night {night} — 3步特征提取")
-    print(f"# 文件: {mff_path}")
-    print(f"# 主通道: {args.eeg_channel}")
-    print(f"# EOG: {args.eog_channels}")
-    print(f"# Epoch: {args.epoch_sec}s, 每半球≤{args.max_per_hemi}通道")
-    print(f"# 跳过YASA: {args.skip_yasa}, 跳过源定位: True (3步模式)")
+    print(f"# Night {night} — 分步特征提取 (subprocess)")
+    print(f"# 文件: {args.mff}")
+    print(f"# 步骤: {steps_to_run}")
     print(f"{'#'*60}\n")
-    t0 = time.time()
+    t_total = time.time()
 
-    try:
-        # ── 导入 SleepEEGFeatureExtractor ──
-        import feature_101night_analy as analy
-        SleepEEGFeatureExtractor = analy.SleepEEGFeatureExtractor
-        print(f"[{night}] 模块加载完成 ({time.time()-t0:.0f}s)")
+    base_args = [
+        '--mff', args.mff,
+        '--night', str(night),
+        '--output', str(out_dir),
+        '--eeg-channel', args.eeg_channel,
+    ]
 
-        # ── 初始化 — 单通道 MNE 加载 (~60 MB) ──
-        ext = SleepEEGFeatureExtractor(
-            mff_path,
-            eeg_channel=args.eeg_channel,
-            load_all_channels=True,  # 允许多通道特征（惰性加载）
-        )
-        print(f"[{night}] 初始化: {ext.n_channels}通道, {ext.sfreq}Hz, "
-              f"{ext.n_times/ext.sfreq/3600:.1f}h ({time.time()-t0:.0f}s)")
+    results = {}
 
-        # ── 运行 3 步流水线 (不含源定位) ──
-        ext.run_all(
-            epoch_sec=args.epoch_sec,
-            groups=('basic', 'time_domain', 'frequency', 'entropy',
-                    'complexity', 'connectivity', 'microstates', 'spatial',
-                    'tsfresh', 'rqa', 'adv_spectral', 'autocorrelation'),
-            skip_yasa=args.skip_yasa,
-            skip_sssm=args.skip_sssm,
-            skip_source_loc=True,          # Step 4 永久禁用
-            yasa_eog_channels=tuple(args.eog_channels),
-            max_per_hemi=args.max_per_hemi,
-        )
+    # ── Step 1: 单通道特征 ──
+    if 1 in steps_to_run:
+        step1_args = base_args + ['--epoch-sec', str(args.epoch_sec)]
+        if args.skip_sssm:
+            step1_args.append('--skip-sssm')
+        ok, elapsed = run_step('step1_single_channel.py', step1_args, night)
+        results[1] = ok
 
-        # ── 保存 CSV ──
-        df = ext.to_dataframe(epoch_sec=args.epoch_sec)
-        csv_path = out_dir / f"features_night{night}_pipeline.csv"
-        df.to_csv(csv_path, index=False)
-        print(f"[{night}] CSV 保存: {csv_path} "
-              f"({len(df)} epochs, {len(df.columns)} cols)")
+    # ── Step 2: YASA 分期 ──
+    if 2 in steps_to_run and not args.skip_yasa:
+        step2_args = base_args + [
+            '--eog-channels', args.eog_channels[0], args.eog_channels[1]]
+        ok, elapsed = run_step('step2_yasa_staging.py', step2_args, night)
+        results[2] = ok
+    elif 2 in steps_to_run:
+        print("[Step 2] 已跳过 (--skip-yasa)")
 
-        # ── 保存 Pickle ──
-        pkl_path = out_dir / f"features_night{night}_pipeline.pkl"
-        ext.save_features(str(pkl_path))
-        print(f"[{night}] PICKLE 保存: {pkl_path}")
+    # ── Step 3: 多通道 ROI ──
+    if 3 in steps_to_run:
+        step3_args = base_args + [
+            '--epoch-sec', str(args.epoch_sec),
+            '--max-per-hemi', str(args.max_per_hemi)]
+        ok, elapsed = run_step('step3_multichannel.py', step3_args, night)
+        results[3] = ok
 
-        elapsed = time.time() - t0
-        print(f"\n[{night}] ✓ 完成 ({elapsed/60:.1f} 分钟)")
-        return 0
+    # ── Step 4: 源定位 ──
+    if 4 in steps_to_run and not args.skip_source:
+        step4_args = base_args + [
+            '--epoch-sec', str(args.epoch_sec),
+            '--method', args.source_method,
+            '--slice-sec', str(args.slice_sec)]
+        ok, elapsed = run_step('step4_source_loc.py', step4_args, night)
+        results[4] = ok
+    elif 4 in steps_to_run:
+        print("[Step 4] 已跳过 (--skip-source)")
 
-    except Exception as e:
-        print(f"[{night}] ✗ 失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-    finally:
-        gc.collect()
+    elapsed = time.time() - t_total
+    ok_count = sum(results.values())
+    total_count = len(results)
+    print(f"\n{'#'*60}")
+    print(f"# Night {night} 完成: {ok_count}/{total_count} 步骤成功 "
+          f"({elapsed/60:.1f} 分钟)")
+    print(f"{'#'*60}")
+
+    return 0 if ok_count == total_count else 1
 
 
 if __name__ == '__main__':
