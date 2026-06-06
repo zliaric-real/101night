@@ -119,6 +119,7 @@ class SleepEEGFeatureExtractor:
     BAND_NAMES = ['delta', 'theta', 'alpha', 'beta', 'gamma']
 
     def __init__(self, file_path, eeg_channel='E21',
+                 eog_channel='E61',
                  load_all_channels: bool = True,
                  filter_low: float = 0.1,
                  filter_high: float = 40.0):
@@ -149,16 +150,30 @@ class SleepEEGFeatureExtractor:
         self.n_channels = len(raw.ch_names)
         self.sfreq = int(raw.info['sfreq'])
 
-        # ── Step 2: 检查主通道 ──
+        # ── Step 2: 检查通道 ──
         if eeg_channel not in self.ch_names:
             eeg_channel = self.ch_names[10]
             self.eeg_channel = eeg_channel
         self._eeg_idx = self.ch_names.index(eeg_channel)
 
-        # ── Step 3: 仅加载主通道数据 ──
-        raw.pick([eeg_channel])
+        # 检查 EOG 通道
+        if eog_channel and eog_channel not in self.ch_names:
+            print(f"[init] ⚠ EOG 通道 {eog_channel} 不存在，不使用 EOG")
+            eog_channel = None
+        self.eog_channel = eog_channel
+
+        # ── Step 3: 一次 pick 加载 EEG+EOG (notebook 验证路径) ──
+        pick_list = [eeg_channel]
+        if eog_channel:
+            pick_list.append(eog_channel)
+        raw.pick(pick_list)
         raw.load_data()
-        self.raw = raw
+
+        # raw_stage: 双通道 Raw 对象，直接给 YASA (不滤波, YASA 内部自行处理)
+        self.raw_stage = raw.copy()
+
+        # raw: 只保留 EEG 单通道，用于特征提取
+        self.raw = raw.copy().pick([eeg_channel])
         self.data = self.raw.get_data(units='uV')[0]  # 1D float64, ~60 MB
 
         # ── Step 3b: MNE 默认 FIR 滤波 (firwin, zero-phase, 自动阶数) ──
@@ -2395,16 +2410,15 @@ class SleepEEGFeatureExtractor:
         print(f"\n[Step 1/4] ✓ 单通道特征提取完成")
 
     def run_step2_yasa_with_eog(self,
-                                 eog_channel='E67',
+                                 eog_channel='E61',
                                  metadata=None):
-        """Step 2: YASA 睡眠分期 — chunked frombuffer 加载 EEG+EOG。
+        """Step 2: YASA 睡眠分期 — 直接使用 __init__ 中 MNE 加载的 raw_stage。
 
-        EEG (E21) 已在 __init__ 中通过 MNE 加载为 self.data。
-        EOG 和用于 YASA 的 EEG 通过 chunked frombuffer 同源加载，
-        确保样本级对齐。避免 MNE read_raw_egi 二次调用挂起问题。
+        __init__ 已通过 MNE read_raw_egi 加载 EEG+EOG 到 self.raw_stage，
+        此方法直接将其送入 YASA SleepStaging (笔记本已验证路径)。
 
         Args:
-            eog_channel: 单侧眼电通道，默认 E67 (左眼, 标准 E1 位置)
+            eog_channel: 单侧眼电通道，默认 E61
             metadata: YASA 可选元数据 {'age': 30, 'male': 0}
         """
         import gc
@@ -2416,57 +2430,34 @@ class SleepEEGFeatureExtractor:
 
         eog_ch = eog_channel
 
-        # ── 获取信号文件实际通道数 (与 MNE 报告的可能不同) ──
-        real_nch = detect_n_channels(self.file_path)
-
-        # ── 通道名 → 列索引 (MNE ch_names 的 EEG 部分与 signal1.bin 列顺序一致) ──
-        eog_idx = self.ch_names.index(eog_ch) if eog_ch in self.ch_names else None
-        eeg_idx = self._eeg_idx  # 在 __init__ 中已计算
-
-        if eog_idx is None:
-            print(f"[Step2] ✗ EOG 通道 {eog_ch} 不在 ch_names 中！仅用 EEG 做分期")
-            self.sleep_stages_yasa(eog_channel=None, metadata=metadata)
+        # ── 验证 raw_stage 存在且包含所需通道 ──
+        if not hasattr(self, 'raw_stage') or self.raw_stage is None:
+            print(f"[Step2] ✗ raw_stage 未初始化！无法分期")
             return
 
-        # ── chunked frombuffer 同时加载 EEG + EOG (同源对齐, ~48 MB) ──
-        print(f"[Step2] chunked 加载 E21 + {eog_ch} (nch={real_nch})...")
-        t_load = time.time()
-        ch_data = _load_channel_data(
-            self.file_path, real_nch, [eeg_idx, eog_idx])
-        eeg_loaded = ch_data[eeg_idx]
-        eog_loaded = ch_data[eog_idx]
-        print(f"[Step2] 加载完成 ({time.time()-t_load:.1f}s) "
-              f"— eeg={len(eeg_loaded)} samples, eog={len(eog_loaded)} samples")
+        if eog_ch and eog_ch not in self.raw_stage.ch_names:
+            print(f"[Step2] ✗ EOG 通道 {eog_ch} 不在 raw_stage 中！仅用 EEG 做分期")
+            eog_ch = None
 
-        # ── 验证对齐: MNE self.data vs chunked eeg_loaded ──
-        min_len = min(len(self.data), len(eeg_loaded))
-        offset_sec = abs(len(self.data) - len(eeg_loaded)) / self.sfreq
-        if offset_sec > 30:
-            print(f"[Step2] ⚠ 样本数偏差 {offset_sec:.1f}s > 30s!")
-            print(f"  MNE self.data: {len(self.data)}, chunked: {len(eeg_loaded)}")
-        else:
-            print(f"[Step2] 对齐偏差: {offset_sec:.1f}s (MNE={len(self.data)}, chunked={len(eeg_loaded)})")
-
-        # 构建 RawArray (用 chunked 加载的 EEG, 确保与 EOG 完美对齐)
-        combined = np.vstack([eeg_loaded[:min_len], eog_loaded[:min_len]])
-        info = mne.create_info(
-            [self.eeg_channel, eog_ch],
-            sfreq=self.sfreq,
-            ch_types=['eeg', 'eog'])
-        raw_stage = mne.io.RawArray(combined, info, verbose=False)
-        del eeg_loaded, eog_loaded, combined, ch_data
+        print(f"[Step2] 使用 EEG={self.eeg_channel}" + 
+              (f" + EOG={eog_ch}" if eog_ch else " (无 EOG)"))
 
         # ── 运行 YASA (LightGBM 模型已内置，秒级加载) ──
         print(f"[Step2] YASA SleepStaging 开始... ")
         t_yasa = time.time()
         try:
-            sls = yasa.SleepStaging(
-                raw_stage,
-                eeg_name=self.eeg_channel,
-                eog_name=eog_ch,
-                metadata=metadata,
-            )
+            yasa_kwargs = dict(eeg_name=self.eeg_channel)
+            if eog_ch:
+                yasa_kwargs['eog_name'] = eog_ch
+            if metadata:
+                yasa_kwargs['metadata'] = metadata
+
+            sls = yasa.SleepStaging(self.raw_stage, **yasa_kwargs)
+            print(f"[Step2]   SleepStaging.__init__ {time.time()-t_yasa:.1f}s")
+
+            t_pred = time.time()
             hypno_pred = np.asarray(sls.predict(), dtype=int)
+            print(f"[Step2]   predict() {time.time()-t_pred:.1f}s")
 
             labels = {0: 'Wake', 1: 'N1', 2: 'N2', 3: 'N3', 4: 'REM'}
             stage_counts = {labels.get(s, s): int((hypno_pred == s).sum())
@@ -2491,11 +2482,11 @@ class SleepEEGFeatureExtractor:
             del sls
         except Exception as e:
             print(f"[Step2] YASA 失败: {e}")
+            import traceback
+            traceback.print_exc()
 
-        # ── 清除数据 ──
-        del raw_stage
         gc.collect()
-        print(f"[Step 2/4] ✓ YASA 分期完成 (EOG 数据已清除)")
+        print(f"[Step 2/4] ✓ YASA 分期完成")
 
     def run_step3_multichannel_roi(self, epoch_sec=30,
                                     max_per_hemi=5,
@@ -2819,7 +2810,7 @@ class SleepEEGFeatureExtractor:
                 skip_sssm: bool = False,
                 skip_source_loc: bool = False,
                 source_method: str = 'eLORETA',
-                yasa_eog_channel='E67',
+                yasa_eog_channel='E61',
                 yasa_metadata=None,
                 max_per_hemi: int = 5):
         """一键运行全部特征提取 — 4 步线性流水线。
