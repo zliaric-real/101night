@@ -6,6 +6,12 @@ SleepEEGFeatureExtractor — 睡眠脑电特征提取器 (增强版)
 
 环境: conda activate eeg_101night
 """
+# -- Env: limit parallelism to avoid sklearn/joblib DLL deadlock on Windows --
+import os as _os
+_os.environ.setdefault('LOKY_MAX_CPU_COUNT', '2')
+_os.environ.setdefault('OMP_NUM_THREADS', '1')
+_os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+
 from pathlib import Path
 
 import mne
@@ -2486,7 +2492,8 @@ class SleepEEGFeatureExtractor:
             print(f"[Step2]   SleepStaging.__init__ {time.time()-t_yasa:.1f}s")
 
             t_pred = time.time()
-            hypno_pred = np.asarray(sls.predict(), dtype=int)
+            print("pre")
+            hypno_pred = sls.predict()
             print(f"[Step2]   predict() {time.time()-t_pred:.1f}s")
 
             labels = {0: 'Wake', 1: 'N1', 2: 'N2', 3: 'N3', 4: 'REM'}
@@ -2500,6 +2507,8 @@ class SleepEEGFeatureExtractor:
                 'eeg_channel': self.eeg_channel,
                 'eog_channel': eog_ch,
             }
+
+            print(hypno_pred.hypno)
 
             del sls
         except Exception as e:

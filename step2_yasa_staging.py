@@ -9,6 +9,11 @@ MNE read_raw_egi → pick [E21, E61] → YASA SleepStaging
   python step2_yasa_staging.py --mff I:/.../Nathalie-40_...mff --night 40
   python step2_yasa_staging.py --mff ... --night 40 --eeg E21 --eog E219
 """
+# -- Env: limit parallelism to avoid sklearn/joblib DLL deadlock on Windows --
+import os as _os
+_os.environ.setdefault('LOKY_MAX_CPU_COUNT', '2')
+_os.environ.setdefault('OMP_NUM_THREADS', '1')
+_os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 
 import sys
 import gc

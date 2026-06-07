@@ -14,44 +14,45 @@ import os
 
 from feature_101night_analy import SleepEEGFeatureExtractor
 
-# 定义两个路径
-paths = [
-    r'E:\idea\101night',
-    r'I:\101Night'
-]
+import numpy as np
+print("NumPy:", np.__version__)
 
-# 初始化列表
-raw_data_list = []
-processed_files = []
-
-# 遍历所有路径
-for path in paths:
-    # 检查路径是否存在
-    if not os.path.exists(path):
-        print(f"路径不存在: {path}")
-        continue
-    
-    # 只遍历当前目录，不进入子目录
-    for item in os.listdir(path):
-        full_path = os.path.join(path, item)
-        
-        # 检查是否为目录且以.mff结尾
-        if os.path.isdir(full_path) and full_path.lower().endswith('.mff'):
-            try:
-                processed_files.append(full_path)
-                print(f"成功读取: {full_path}")
-            except Exception as e:
-                print(f"读取文件夹 {full_path} 时出错: {e}")
-
-# 打印统计信息
-print(f"\n总共找到 {len(processed_files)} 个.mff文件夹")
-
-
-extractor = SleepEEGFeatureExtractor(file_path=processed_files[0])
-
-sls = extractor.sleep_stages_yasa()
-
-print(sls.hypno)
+# # 定义两个路径
+# paths = [
+#     r'E:\idea\101night',
+#     r'I:\101Night'
+# ]
+#
+# # 初始化列表
+# raw_data_list = []
+# processed_files = []
+#
+# # 遍历所有路径
+# for path in paths:
+#     # 检查路径是否存在
+#     if not os.path.exists(path):
+#         print(f"路径不存在: {path}")
+#         continue
+#
+#     # 只遍历当前目录，不进入子目录
+#     for item in os.listdir(path):
+#         full_path = os.path.join(path, item)
+#
+#         # 检查是否为目录且以.mff结尾
+#         if os.path.isdir(full_path) and full_path.lower().endswith('.mff'):
+#             try:
+#                 processed_files.append(full_path)
+#                 print(f"成功读取: {full_path}")
+#             except Exception as e:
+#                 print(f"读取文件夹 {full_path} 时出错: {e}")
+#
+# # 打印统计信息
+# print(f"\n总共找到 {len(processed_files)} 个.mff文件夹")
+#
+#
+# extractor = SleepEEGFeatureExtractor(file_path=processed_files[0])
+#
+# sls = extractor.run_step2_yasa_with_eog()
 
 # class SleepEEGFeatureExtractor:
 #     """

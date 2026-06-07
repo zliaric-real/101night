@@ -15,6 +15,11 @@ extract_single_night.py — 单夜特征提取编排器 (subprocess 模式)
   python extract_single_night.py --mff ... --night 40 --steps 1,2,3       # 只跑指定步骤
   python extract_single_night.py --mff ... --night 40 --skip-yasa         # 跳过 YASA
 """
+# -- Env: limit parallelism to avoid sklearn/joblib DLL deadlock on Windows --
+import os as _os
+_os.environ.setdefault('LOKY_MAX_CPU_COUNT', '2')
+_os.environ.setdefault('OMP_NUM_THREADS', '1')
+_os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 
 import sys
 import subprocess
