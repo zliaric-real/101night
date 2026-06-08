@@ -124,6 +124,16 @@ class SleepEEGFeatureExtractor:
     BAND_EDGES = np.array([0.5, 4, 8, 13, 30, 45])
     BAND_NAMES = ['delta', 'theta', 'alpha', 'beta', 'gamma']
 
+    # ---- 连接性分析专用频段（比单通道多 sigma 睡眠纺锤波频段） ----
+    CONN_BANDS = {
+        'delta': (0.5, 4),
+        'theta': (4, 8),
+        'alpha': (8, 12),
+        'sigma': (12, 16),   # 睡眠纺锤波 — sleep-critical
+        'beta':  (16, 30),
+        'gamma': (30, 40),
+    }
+
     def __init__(self, file_path, eeg_channel='E21',
                  eog_channel='E61',
                  load_all_channels: bool = True,
@@ -1742,58 +1752,166 @@ class SleepEEGFeatureExtractor:
     # ================================================================
 
     def functional_connectivity(self, epoch_sec: float = 30,
-                                methods=('coherence', 'plv', 'correlation'),
-                                use_roi: bool = True, n_rois: int = 25):
+                                methods=('coherence', 'plv', 'pli',
+                                         'imcoh', 'correlation'),
+                                use_roi: bool = True, n_rois: int = 25,
+                                bands=None):
         """
         多通道功能连接矩阵（每 epoch）。
 
         Args:
             epoch_sec: epoch 长度
-            methods: 连接度量方式，可选 'coherence', 'plv', 'pli', 'correlation'
+            methods: 连接度量方式，可选 'coherence', 'plv', 'pli',
+                     'imcoh', 'correlation'
             use_roi: 是否使用 ROI 聚合模式（默认 True）
-                     True  → 260 通道 → k-means 空间聚类 → n_rois 个脑区
-                     False → 直接使用全部通道（内存/计算量极大）
-            n_rois: ROI 数量（默认 25）
+                     True  → 半球通道模式直接取 _hemi_filted_cache
+                     False → 直接使用全部通道
+            n_rois: ROI 数量（仅 k-means 模式用，默认 25）
+            bands: None → 宽带（向后兼容，0.5-40 Hz 均值）
+                   dict → 分频段，每个 band 生成独立矩阵
+                   例: self.CONN_BANDS 或 {'delta': (0.5,4), ...}
 
         Returns:
-            dict: {method: ndarray shape (n_epochs, n_ch, n_ch)}
+            dict: {method_bandname: ndarray (n_epochs, n_ch, n_ch)}
+                  宽带模式 key='coherence'/'plv' 等
+                  分频模式 key='coherence_delta'/'plv_sigma' 等
         """
         if not self._load_all:
-            print("[Connectivity] 未启用多通道模式，请在 __init__ 设置 load_all_channels=True")
+            print("[Connectivity] 未启用多通道模式，请在 __init__ 设置 "
+                  "load_all_channels=True")
             return None
 
-        if use_roi:
-            data = self._get_roi_data(n_rois=n_rois, filtered=True)
+        if bands is None:
+            bands = {'_broadband': (0.5, 40)}  # 向后兼容
+            suffix_fn = lambda b: ''            # 不追加 band 后缀
         else:
-            data = self._get_filted_all()
+            suffix_fn = lambda b: f'_{b}'       # 追加 _delta 等
 
-        n_ch = data.shape[0]
-        n_epochs = int(data.shape[1] // (epoch_sec * self.sfreq))
+        # 剔除 imcoh（频域法，直接取虚部，不需要宽带 scipy.coherence）
+        # 剔除 correlation（时域法，不需要频段）
+
+        if use_roi:
+            data_filt = self._get_roi_data(n_rois=n_rois, filtered=True)
+        else:
+            data_filt = self._get_filted_all()
+
+        n_ch = data_filt.shape[0]
+        n_epochs = int(data_filt.shape[1] // (epoch_sec * self.sfreq))
         if n_epochs == 0:
             return None
         epoch_samples = int(epoch_sec * self.sfreq)
 
         label = f"ROI-{n_ch}ch" if use_roi else f"{n_ch}ch"
-        print(f"[Connectivity] {label} 模式: {n_epochs} epochs, {n_ch}×{n_ch} "
-              f"= {n_ch*(n_ch-1)//2} pairs")
+        n_bands = len(bands)
+        n_pairs = n_ch * (n_ch - 1) // 2
+        print(f"[Connectivity] {label} 模式: {n_epochs} epochs, "
+              f"{n_ch}×{n_ch} = {n_pairs} pairs, {n_bands} band(s)")
 
+        # 初始化存储：每方法每频段一个 (n_epochs, n_ch, n_ch) 矩阵
         results = {}
         for method in methods:
-            results[method] = np.zeros((n_epochs, n_ch, n_ch))
+            for bname in bands:
+                key = f"{method}{suffix_fn(bname)}"
+                results[key] = np.zeros((n_epochs, n_ch, n_ch))
+
+        # 频域方法：不逐对 scipy.coherence，而是批量 Welch/CSD
+        freq_methods = {'coherence', 'imcoh'}
 
         iterator = range(n_epochs)
         if HAS_TQDM:
             iterator = tqdm(iterator, desc=f"Connectivity ({label})")
 
         for ep in iterator:
-            seg = data[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+            seg = data_filt[:, ep * epoch_samples:
+                               (ep + 1) * epoch_samples]
 
-            for method in methods:
-                mat = self._connectivity_matrix(seg, method)
-                results[method][ep] = mat
+            for bname, (f_low, f_high) in bands.items():
+                suff = suffix_fn(bname)
+
+                # ── 频域方法：批量 Welch/CSD（比逐对 scipy.coherence 快） ──
+                active_freq = [m for m in methods if m in freq_methods]
+                if active_freq:
+                    # 预计算所有通道的 Welch PSD 和通道对 CSD
+                    psd_cache = {}
+                    csd_cache = {}
+                    nperseg = min(256, seg.shape[1] // 2)
+                    band_mask = None  # lazy init
+
+                    for m in active_freq:
+                        mat = np.zeros((n_ch, n_ch))
+                        for i in range(n_ch):
+                            if i not in psd_cache:
+                                f_i, Pxx = signal.welch(
+                                    seg[i], fs=self.sfreq, nperseg=nperseg)
+                                psd_cache[i] = (f_i, Pxx)
+                            else:
+                                f_i, Pxx = psd_cache[i]
+                            if band_mask is None:
+                                band_mask = (f_i >= f_low) & (f_i <= f_high)
+
+                            for j in range(i + 1, n_ch):
+                                if (i, j) not in csd_cache:
+                                    f_ij, Pxy = signal.csd(
+                                        seg[i], seg[j], fs=self.sfreq,
+                                        nperseg=nperseg)
+                                    csd_cache[(i, j)] = (f_ij, Pxy)
+                                else:
+                                    f_ij, Pxy = csd_cache[(i, j)]
+
+                                _, Pyy = psd_cache.setdefault(
+                                    j, signal.welch(
+                                        seg[j], fs=self.sfreq,
+                                        nperseg=nperseg))
+
+                                if m == 'coherence':
+                                    coh = (np.abs(Pxy) ** 2) / (Pxx * Pyy)
+                                    mat[i, j] = mat[j, i] = np.mean(
+                                        coh[band_mask])
+                                elif m == 'imcoh':
+                                    coherency = Pxy / np.sqrt(Pxx * Pyy)
+                                    mat[i, j] = mat[j, i] = np.mean(
+                                        np.abs(np.imag(coherency[band_mask])))
+
+                        key = f"{m}{suff}"
+                        results[key][ep] = mat
+
+                # ── 相位方法 PLV/PLI：需 band-pass 滤波后 Hilbert ──
+                active_phase = [m for m in methods
+                                if m in ('plv', 'pli')]
+                if active_phase:
+                    # band-pass filter each channel once
+                    sos = signal.butter(4, [f_low / (self.sfreq / 2),
+                                            f_high / (self.sfreq / 2)],
+                                        btype='band', output='sos')
+                    seg_band = signal.sosfiltfilt(sos, seg, axis=1)
+
+                    for m in active_phase:
+                        mat = np.zeros((n_ch, n_ch))
+                        for i in range(n_ch):
+                            xa = signal.hilbert(seg_band[i])
+                            for j in range(i + 1, n_ch):
+                                ya = signal.hilbert(seg_band[j])
+                                phase_diff = np.angle(xa) - np.angle(ya)
+                                if m == 'plv':
+                                    val = np.abs(np.mean(
+                                        np.exp(1j * phase_diff)))
+                                else:  # pli
+                                    val = np.abs(np.mean(
+                                        np.sign(phase_diff)))
+                                mat[i, j] = mat[j, i] = val
+                        key = f"{m}{suff}"
+                        results[key][ep] = mat
+
+                # ── 时域方法 correlation：宽带即可，只做一次 ──
+                if 'correlation' in methods and bname == list(bands.keys())[0]:
+                    corr = np.corrcoef(seg)
+                    np.fill_diagonal(corr, 0)
+                    key = f"correlation{suff}"
+                    results[key][ep] = corr
 
         meta = {'epoch_sec': epoch_sec, 'methods': methods,
-                'use_roi': use_roi, 'n_channels': n_ch}
+                'use_roi': use_roi, 'n_channels': n_ch,
+                'bands': bands if bands != {'_broadband': (0.5, 40)} else None}
         if use_roi:
             if hasattr(self, '_roi_groups'):
                 meta['roi_groups'] = self._roi_groups
@@ -1802,39 +1920,6 @@ class SleepEEGFeatureExtractor:
         self.features['connectivity'] = {'values': results, 'meta': meta}
         print("功能连接计算完成")
         return results
-
-    def _connectivity_matrix(self, data: np.ndarray, method: str):
-        """
-        计算连接矩阵。
-
-        Args:
-            data: shape (n_channels, n_times)
-            method: 'coherence', 'plv', 'pli', 'correlation'
-
-        Returns:
-            ndarray shape (n_ch, n_ch)
-        """
-        n_ch = data.shape[0]
-        mat = np.zeros((n_ch, n_ch))
-
-        if method == 'correlation':
-            corr = np.corrcoef(data)
-            mat = corr
-            np.fill_diagonal(mat, 0)
-            return mat
-
-        # 频域方法需要 PSD / 交叉谱
-        for i in range(n_ch):
-            for j in range(i + 1, n_ch):
-                if method == 'coherence':
-                    f, cxy = signal.coherence(data[i], data[j],
-                                              fs=self.sfreq, nperseg=min(256, len(data[i]) // 2))
-                    mat[i, j] = mat[j, i] = np.mean(cxy[(f >= 0.5) & (f <= 40)])
-                elif method == 'plv':
-                    mat[i, j] = mat[j, i] = self._plv(data[i], data[j])
-                elif method == 'pli':
-                    mat[i, j] = mat[j, i] = self._pli(data[i], data[j])
-        return mat
 
     @staticmethod
     def _plv(x, y):
@@ -1851,6 +1936,124 @@ class SleepEEGFeatureExtractor:
         ya = signal.hilbert(y)
         phase_diff = np.angle(xa) - np.angle(ya)
         return np.abs(np.mean(np.sign(phase_diff)))
+
+    def _imcoh_pair(self, x, y, f_low, f_high):
+        """虚部相干 (Imaginary Coherence) — 指定频段内均值。
+
+        原理：容积传导产生零相位（纯实部）耦合，只取虚部可以
+        抑制容积传导伪影，保留真正的神经交互信号。
+
+        iCOH = |imag( Pxy / sqrt(Pxx·Pyy) )|
+
+        Returns:
+            float: 频段内平均虚部相干值
+        """
+        nperseg = min(256, len(x) // 2)
+        f, Pxy = signal.csd(x, y, fs=self.sfreq, nperseg=nperseg)
+        f, Pxx = signal.welch(x, fs=self.sfreq, nperseg=nperseg)
+        f, Pyy = signal.welch(y, fs=self.sfreq, nperseg=nperseg)
+        coherency = Pxy / np.sqrt(Pxx * Pyy)  # 复数 coherency
+        band_mask = (f >= f_low) & (f <= f_high)
+        return np.mean(np.abs(np.imag(coherency[band_mask])))
+
+    def _granger_causality(self, epoch_sec=30, max_lag=5,
+                           bands=None, use_roi=True):
+        """格兰杰因果分析 — 独立可选方法（不纳入默认连接性分析）。
+
+        时间域 Granger F-test: 对每对通道分别评估 x→y 和 y→x
+        的因果影响强度（F 统计量）。
+
+        Args:
+            epoch_sec: epoch 长度
+            max_lag: VAR 模型最大滞后阶数（默认 5，越大越慢）
+            bands: 频段字典，None 为宽带
+            use_roi: 是否使用 ROI/半球聚合模式
+
+        Returns:
+            dict: {
+                'gc_x_to_y': ndarray (n_epochs, n_ch, n_ch),
+                'gc_y_to_x': ndarray (n_epochs, n_ch, n_ch),
+            }
+            注意：矩阵不对称，mat[i,j] = channel_i → channel_j
+
+        Performance:
+            10 通道 × 45 对 × 6 频段 × ~5ms ≈ 1.3s/epoch
+            400 epochs ≈ 9 分钟 — 建议先在小数据上测试
+        """
+        try:
+            from statsmodels.tsa.stattools import grangercausalitytests
+        except ImportError:
+            print("[GC] statsmodels 未安装 — pip install statsmodels")
+            return None
+
+        if not self._load_all:
+            print("[GC] 未启用多通道模式")
+            return None
+
+        if bands is None:
+            bands = {'broadband': (0.5, 40)}
+
+        if use_roi:
+            data = self._get_roi_data(filtered=True)
+        else:
+            data = self._get_filted_all()
+
+        n_ch = data.shape[0]
+        n_epochs = int(data.shape[1] // (epoch_sec * self.sfreq))
+        if n_epochs == 0:
+            return None
+        epoch_samples = int(epoch_sec * self.sfreq)
+
+        print(f"[GC] {n_ch}ch × {len(bands)} band(s), "
+              f"max_lag={max_lag}, {n_epochs} epochs")
+        print("[GC] ⚠ 耗时较长，建议先用 5 epoch 测试")
+
+        gc_x_to_y = {b: np.zeros((n_epochs, n_ch, n_ch)) for b in bands}
+        gc_y_to_x = {b: np.zeros((n_epochs, n_ch, n_ch)) for b in bands}
+
+        from scipy.signal import butter, sosfiltfilt
+        iterator = range(n_epochs)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, desc="Granger")
+
+        for ep in iterator:
+            seg = data[:, ep * epoch_samples:(ep + 1) * epoch_samples]
+            for band_name, (f_low, f_high) in bands.items():
+                # band-pass filter
+                sos = butter(4, [f_low, f_high], btype='band',
+                             fs=self.sfreq, output='sos')
+                seg_filt = sosfiltfilt(sos, seg, axis=1)
+
+                for i in range(n_ch):
+                    for j in range(i + 1, n_ch):
+                        # x→y
+                        data_xy = np.column_stack(
+                            [seg_filt[j], seg_filt[i]])
+                        gc_xy = grangercausalitytests(
+                            data_xy, maxlag=[max_lag], verbose=False)
+                        f_xy = gc_xy[max_lag][0]['ssr_ftest'][0]
+
+                        # y→x
+                        data_yx = np.column_stack(
+                            [seg_filt[i], seg_filt[j]])
+                        gc_yx = grangercausalitytests(
+                            data_yx, maxlag=[max_lag], verbose=False)
+                        f_yx = gc_yx[max_lag][0]['ssr_ftest'][0]
+
+                        gc_x_to_y[band_name][ep, i, j] = f_xy
+                        gc_y_to_x[band_name][ep, i, j] = f_yx
+                        gc_x_to_y[band_name][ep, j, i] = f_yx
+                        gc_y_to_x[band_name][ep, j, i] = f_xy
+
+        result = {
+            'gc_x_to_y': gc_x_to_y,
+            'gc_y_to_x': gc_y_to_x,
+            'meta': {'epoch_sec': epoch_sec, 'max_lag': max_lag,
+                     'bands': bands, 'n_channels': n_ch},
+        }
+        self.features['granger_causality'] = result
+        print("[GC] 格兰杰因果分析完成")
+        return result
 
     # ================================================================
     #  Part 11 — 多通道特征: 微状态
@@ -2579,9 +2782,10 @@ class SleepEEGFeatureExtractor:
         # ── 5. 运行多通道特征 ──
         try:
             if 'connectivity' in groups:
-                print("\n--- 功能连接 (半球代表通道) ---")
+                print("\n--- 功能连接 (半球代表通道, 6 频段) ---")
                 self.functional_connectivity(
-                    epoch_sec=epoch_sec, use_roi=True)
+                    epoch_sec=epoch_sec, use_roi=True,
+                    bands=self.CONN_BANDS)
 
             if 'microstates' in groups:
                 print("\n--- 微状态分析 (半球代表通道) ---")
