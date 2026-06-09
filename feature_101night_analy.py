@@ -135,7 +135,7 @@ class SleepEEGFeatureExtractor:
     }
 
     def __init__(self, file_path, eeg_channel='E21',
-                 eog_channel='E61',
+                 eog_channel='E67',
                  load_all_channels: bool = True,
                  max_per_hemi: int = 5,
                  filter_low: float = 0.1,
@@ -145,7 +145,7 @@ class SleepEEGFeatureExtractor:
         - 全部 .mff 数据读取走 MNE read_raw_egi → pick → load_data
         - 不使用 chunked frombuffer / _load_channel_data（仅 Step 4 源定位例外，暂搁置）
         - 在 __init__ 中一次性确定并加载前三步所需全部通道：
-            E21 (EEG) + E61 (EOG) + 半球代表通道 (~10ch)
+            E21 (EEG) + E67 (EOG) + 半球代表通道 (~10ch)
 
         Args:
             file_path: .mff文件路径
@@ -658,7 +658,7 @@ class SleepEEGFeatureExtractor:
             return None
 
     def sleep_stages_yasa(self,
-                          eog_channel='E61',
+                          eog_channel='E67',
                           metadata=None):
         """
         使用 YASA 进行自动睡眠分期。
@@ -668,7 +668,7 @@ class SleepEEGFeatureExtractor:
           - eog_name: 眼电导联 (提高 Wake/REM 判别准确率)
 
         Args:
-            eog_channel: 单侧眼电通道, 默认 'E61'
+            eog_channel: 单侧眼电通道, 默认 'E67'
             metadata: 可选元数据 dict, 如 {'age': 30, 'male': 0}
 
         Returns:
@@ -2649,7 +2649,7 @@ class SleepEEGFeatureExtractor:
         print(f"\n[Step 1/4] ✓ 单通道特征提取完成")
 
     def run_step2_yasa_with_eog(self,
-                                 eog_channel='E61',
+                                 eog_channel='E67',
                                  metadata=None):
         """Step 2: YASA 睡眠分期 — 直接使用 __init__ 中 MNE 加载的 raw_stage。
 
@@ -2657,7 +2657,7 @@ class SleepEEGFeatureExtractor:
         此方法直接将其送入 YASA SleepStaging (笔记本已验证路径)。
 
         Args:
-            eog_channel: 单侧眼电通道，默认 E61
+            eog_channel: 单侧眼电通道，默认 E67
             metadata: YASA 可选元数据 {'age': 30, 'male': 0}
         """
         import gc
@@ -2710,8 +2710,6 @@ class SleepEEGFeatureExtractor:
                 'eeg_channel': self.eeg_channel,
                 'eog_channel': eog_ch,
             }
-
-            print(hypno_pred.hypno)
 
             del sls
         except Exception as e:
@@ -3044,7 +3042,7 @@ class SleepEEGFeatureExtractor:
                 skip_sssm: bool = False,
                 skip_source_loc: bool = False,
                 source_method: str = 'eLORETA',
-                yasa_eog_channel='E61',
+                yasa_eog_channel='E67',
                 yasa_metadata=None,
                 max_per_hemi: int = 5):
         """一键运行全部特征提取 — 4 步线性流水线。
@@ -3065,7 +3063,7 @@ class SleepEEGFeatureExtractor:
             skip_sssm: 跳过 SSSM 特征波检测
             skip_source_loc: 跳过 Step 4 源定位
             source_method: 逆解方法 'eLORETA'/'dSPM'/'MNE'
-            yasa_eog_channel: 单侧眼电通道，默认 'E61'
+            yasa_eog_channel: 单侧眼电通道，默认 'E67'
             yasa_metadata: YASA 可选元数据
             max_per_hemi: Step 3 每半球最多通道数 (默认 5)
         """

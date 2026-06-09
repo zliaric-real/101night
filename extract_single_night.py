@@ -3,7 +3,7 @@
 extract_single_night.py — 单夜特征提取
 =======================================
 直接使用 SleepEEGFeatureExtractor (in-process, 无 subprocess)。
-__init__ 已通过 MNE 一次性加载 E21+E61+半球通道并预滤波，
+__init__ 已通过 MNE 一次性加载 E21+E67+半球通道并预滤波，
 run_all() 线性执行 Step 1→2→3。
 
 Step 4 源定位暂搁置，默认不调用。
@@ -39,7 +39,7 @@ def main():
     parser.add_argument('--night', type=int, required=True)
     parser.add_argument('--output', default=None, help='输出目录 (默认: 当前目录)')
     parser.add_argument('--eeg-channel', default='E21')
-    parser.add_argument('--eog-channel', default='E61')
+    parser.add_argument('--eog-channel', default='E67')
     parser.add_argument('--epoch-sec', type=float, default=30)
     parser.add_argument('--max-per-hemi', type=int, default=5,
                         help='每半球代表通道数 (默认 5)')

@@ -73,7 +73,7 @@ warnings.filterwarnings('ignore')
 PROJECT_DIR = Path(__file__).resolve().parent
 
 DEFAULT_DATA_DIRS = [
-    Path("I:/101Night"),
+    Path("D:/101Night"),
     Path("E:/zhaochenhao/data/101Night"),
 ]
 
@@ -312,7 +312,7 @@ def _load_extractor_class():
 def process_one_file(rec: dict) -> dict | None:
     """处理单个 .mff 文件，提取 Step 1+2 特征。
 
-    仅加载 E21+E61 通道（~60 MB），跳过半球通道预加载。
+    仅加载 E21+E67 通道（~60 MB），跳过半球通道预加载。
     返回的 DataFrame 每行对应一个 30s epoch。
 
     Args:
@@ -342,11 +342,11 @@ def process_one_file(rec: dict) -> dict | None:
         SleepEEGFeatureExtractor = _load_extractor_class()
         t0 = time.time()
 
-        # ── 初始化 (load_all_channels=False → 只加载 E21+E61) ──
+        # ── 初始化 (load_all_channels=False → 只加载 E21+E67) ──
         ext = SleepEEGFeatureExtractor(
             mff_path,
             eeg_channel='E21',
-            eog_channel='E61',
+            eog_channel='E67',
             load_all_channels=False,
             max_per_hemi=5,
         )

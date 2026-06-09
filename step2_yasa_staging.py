@@ -2,7 +2,7 @@
 """
 step2_yasa_staging.py — Step 2: YASA 睡眠分期
 ==============================================
-MNE read_raw_egi → pick [E21, E61] → YASA SleepStaging
+MNE read_raw_egi → pick [E21, E67] → YASA SleepStaging
 笔记本已验证路径，无需 chunked frombuffer / RawArray。
 
 用法:
@@ -36,7 +36,7 @@ def main():
     parser.add_argument('--night', type=int, required=True)
     parser.add_argument('--output', default=None, help='输出目录 (默认: 当前目录)')
     parser.add_argument('--eeg', default='E21', help='EEG 通道名')
-    parser.add_argument('--eog', default='E61', help='EOG 通道名 (单侧)')
+    parser.add_argument('--eog', default='E67', help='EOG 通道名 (单侧)')
     args = parser.parse_args()
 
     out_dir = Path(args.output) if args.output else PROJECT_DIR
